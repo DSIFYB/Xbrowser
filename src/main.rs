@@ -1,8 +1,11 @@
+mod instance;
+mod internal;
 mod library;
 mod menu;
 mod navigation;
 mod preview;
 mod restore_test;
+mod settings;
 mod shortcuts;
 mod smoke;
 mod storage;
@@ -56,6 +59,11 @@ enum Action {
     Menu,
     Completed(TabId, String, bool),
     RestoreChecked(TabId, String),
+    Settings,
+    SettingsChanged,
+    BookmarksChanged,
+    OpenSaved(String),
+    OpenAllBookmarks,
 }
 static PROXY: OnceLock<EventLoopProxy<Action>> = OnceLock::new();
 static PARENT_PROC: OnceLock<isize> = OnceLock::new();
@@ -145,6 +153,7 @@ struct Tab {
     url: String,
     title: String,
     pinned: bool,
+    loaded: bool,
 }
 impl Tab {
     fn live(&self) -> Result<&WebView, Box<dyn Error>> {
@@ -171,6 +180,9 @@ struct Browser {
     restore_test: bool,
     restore_step: usize,
     restore_done: bool,
+    preferences: settings::Settings,
+    form_token: String,
+    restore_bookmark: i64,
 }
 impl Browser {
     fn error(&mut self, message: impl std::fmt::Display) {
@@ -237,28 +249,46 @@ impl Browser {
         std::fs::create_dir_all(&profile)?;
         self.database = profile.join("browser.sqlite3");
         self.store = Some(storage::Store::open(&self.database)?);
+        self.preferences = self.store.as_ref().unwrap().settings()?;
         let session = self.store.as_ref().unwrap().load_session()?;
         self.context = Some(WebContext::new(Some(profile)));
         self.window = Some(window);
         self.shortcuts = Some(shortcuts::Shortcuts::install()?);
-        if !self.smoke && !self.preview && !session.tabs.is_empty() {
+        if self.preferences.restore_session
+            && !self.smoke
+            && !self.preview
+            && !session.tabs.is_empty()
+        {
             for saved in session.tabs {
                 self.tabs.add(Tab {
                     view: None,
                     url: saved.url,
                     title: saved.title,
                     pinned: saved.pinned,
+                    loaded: false,
                 });
             }
             let id = self.tabs.entries()[session.active.min(self.tabs.len() - 1)].id;
+            if !self.preferences.lazy_restore {
+                let ids = self
+                    .tabs
+                    .entries()
+                    .iter()
+                    .map(|tab| tab.id)
+                    .collect::<Vec<_>>();
+                for id in ids {
+                    self.ensure_view(id)?;
+                }
+            }
             self.select_tab(id)?;
             self.resize()?;
         } else {
-            self.add_tab(if self.smoke {
-                "https://example.com/"
+            let startup = if self.smoke {
+                "https://example.com/".to_string()
             } else {
-                "about:blank"
-            })?;
+                self.preferences.home_url.clone()
+            };
+            self.add_tab(&startup)?;
         }
         if self.preview {
             self.add_tab("https://example.com/")?;
@@ -283,6 +313,7 @@ impl Browser {
                 "Загрузка…".into()
             },
             pinned: false,
+            loaded: false,
         });
         self.sync_tabs()?;
         self.set_address();
@@ -294,51 +325,24 @@ impl Browser {
         // All tabs explicitly reuse the first tab's COM environment and default profile.
         let environment = self.environment.clone();
         let database = self.database.clone();
+        let token = self.form_token.clone();
+        let navigation_token = token.clone();
         let mut builder = WebViewBuilder::new_with_web_context(
             self.context.as_mut().ok_or("Profile is missing")?,
         )
         .with_visible(false)
         .with_custom_protocol("axiom".into(), move |_, request| {
-            let path = request.uri().path();
-            let allowed = request.uri().host() == Some("localhost")
-                && matches!(path, "/" | "/history" | "/bookmarks");
-            let body = if !allowed {
-                b"Not found".to_vec()
-            } else if path == "/" {
-                include_bytes!("../assets/new_tab.html").to_vec()
-            } else {
-                match storage::Store::open(&database).and_then(|store| {
-                    if path == "/history" {
-                        store.history()
-                    } else {
-                        store.bookmarks()
-                    }
-                }) {
-                    Ok(entries) => library::render(
-                        if path == "/history" {
-                            library::Page::History
-                        } else {
-                            library::Page::Bookmarks
-                        },
-                        &entries,
-                    )
-                    .into_bytes(),
-                    Err(err) => {
-                        format!("Не удалось открыть локальное хранилище: {err}").into_bytes()
-                    }
-                }
-            };
-            wry::http::Response::builder()
-                .status(if allowed { 200 } else { 404 })
-                .header("Content-Type", "text/html; charset=utf-8")
-                .body(std::borrow::Cow::Owned(body))
-                .expect("Static response is valid")
+            internal::respond(&database, &token, request)
         })
         .with_bounds(Rect {
             position: wry::dpi::PhysicalPosition::new(0, 100).into(),
             size: wry::dpi::PhysicalSize::new(1100, 680).into(),
         })
-        .with_navigation_handler(|url| {
+        .with_navigation_handler(move |url| {
+            if let Some(action) = internal::navigation_action(&url, &navigation_token) {
+                send(action);
+                return false;
+            }
             url == "about:blank"
                 || url::Url::parse(&url).is_ok_and(|url| {
                     matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
@@ -466,6 +470,8 @@ impl Browser {
                         "axiom://history"
                     } else if tab.value.url == "http://axiom.localhost/bookmarks" {
                         "axiom://bookmarks"
+                    } else if tab.value.url == "http://axiom.localhost/settings" {
+                        "axiom://settings"
                     } else if tab.value.url == "about:blank" {
                         ""
                     } else {
@@ -514,7 +520,14 @@ impl Browser {
                 let url = match input.trim() {
                     "axiom://history" => "http://axiom.localhost/history".into(),
                     "axiom://bookmarks" => "http://axiom.localhost/bookmarks".into(),
-                    _ => navigation::resolve_input(&input)?,
+                    "axiom://settings" => "http://axiom.localhost/settings".into(),
+                    _ => {
+                        if self.preferences.search_engine == settings::SearchEngine::Google {
+                            navigation::resolve_input(&input)?
+                        } else {
+                            navigation::resolve_with_engine(&input, self.preferences.search_engine)?
+                        }
+                    }
                 };
                 let tab = self.tabs.active_mut().ok_or("No active tab")?;
                 tab.value.live()?.load_url(&url)?;
@@ -547,7 +560,7 @@ impl Browser {
                     .Reload()?;
             },
             Action::NewTab => {
-                self.add_tab("about:blank")?;
+                self.add_tab(&self.preferences.home_url.clone())?;
                 self.act(Action::FocusAddress)?;
             }
             Action::CloseTab => {
@@ -619,6 +632,7 @@ impl Browser {
                 let Some(tab) = self.tabs.get_mut(id) else {
                     return Ok(());
                 };
+                tab.value.loaded = true;
                 tab.value.url = if url == "http://axiom.localhost/" || url == "axiom://localhost/" {
                     "about:blank".into()
                 } else {
@@ -677,8 +691,19 @@ impl Browser {
             Action::ToggleBookmark => {
                 if let (Some(store), Some(tab)) = (&self.store, self.tabs.active()) {
                     if storage::is_external(&tab.value.url) {
-                        store.toggle_bookmark(&tab.value.url, &tab.value.title)?;
-                        self.sync_tabs()?;
+                        let existing = store
+                            .bookmarks()?
+                            .into_iter()
+                            .find(|entry| entry.url == tab.value.url);
+                        if let Some(entry) = existing {
+                            self.add_tab(&format!(
+                                "http://axiom.localhost/bookmarks?edit={}",
+                                entry.id
+                            ))?;
+                        } else {
+                            store.toggle_bookmark(&tab.value.url, &tab.value.title)?;
+                            self.sync_tabs()?;
+                        }
                     }
                 }
             }
@@ -707,6 +732,27 @@ impl Browser {
                 }
             }
             Action::RestoreChecked(id, result) => self.advance_restore(id, result)?,
+            Action::Settings => self.add_tab("http://axiom.localhost/settings")?,
+            Action::SettingsChanged => {
+                self.preferences = self.store.as_ref().ok_or("No store")?.settings()?;
+                for tab in self.tabs.entries() {
+                    if tab.value.url == "about:blank" {
+                        if let Some(view) = &tab.value.view {
+                            unsafe {
+                                view.webview().Reload()?;
+                            }
+                        }
+                    }
+                }
+            }
+            Action::BookmarksChanged => self.sync_tabs()?,
+            Action::OpenSaved(url) => self.add_tab(&url)?,
+            Action::OpenAllBookmarks => {
+                let entries = self.store.as_ref().ok_or("No store")?.bookmarks()?;
+                for entry in entries {
+                    self.add_tab(&entry.url)?;
+                }
+            }
         }
         self.persist()?;
         Ok(())
@@ -735,6 +781,28 @@ impl ApplicationHandler<Action> for Browser {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                if self.preferences.confirm_close_multiple
+                    && self.tabs.len() > 1
+                    && !self.smoke
+                    && !self.restore_test
+                    && !self.preview
+                {
+                    let accepted = unsafe {
+                        MessageBoxW(
+                            std::ptr::null_mut(),
+                            wide(&format!(
+                                "Закрыть окно с {} вкладками? Открытые страницы будут сохранены.",
+                                self.tabs.len()
+                            ))
+                            .as_ptr(),
+                            wide("Axiom Browser").as_ptr(),
+                            MB_YESNO | MB_ICONQUESTION,
+                        )
+                    };
+                    if accepted != IDYES {
+                        return;
+                    }
+                }
                 if let Err(err) = self.persist() {
                     self.error(err);
                 }
@@ -777,11 +845,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             store.toggle_bookmark("https://rust-lang.org/", "Rust")?;
         }
         store.save_session(&storage::Session {
-            active: 1,
+            active: 3,
             tabs: [
-                ("https://example.com/", "Example"),
-                ("https://rust-lang.org/", "Rust"),
-                ("https://example.org/", "Unloaded"),
+                (
+                    "https://example.com/",
+                    "Saved first page with a long descriptive title",
+                ),
+                (
+                    "https://example.org/",
+                    "Saved second page with a long descriptive title",
+                ),
+                (
+                    "https://example.com/",
+                    "Saved third page with a long descriptive title",
+                ),
+                (
+                    "https://rust-lang.org/",
+                    "Saved fourth page with a long descriptive title",
+                ),
             ]
             .into_iter()
             .map(|(url, title)| storage::SavedTab {
@@ -790,6 +871,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 pinned: false,
             })
             .collect(),
+        })?;
+        store.save_settings(&settings::Settings {
+            lazy_restore: !std::env::args().any(|arg| arg == "--restore-all"),
+            ..Default::default()
         })?;
         println!("SESSION_SEEDED");
         return Ok(());
@@ -801,6 +886,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     let smoke = std::env::args().any(|arg| arg == "--smoke-test");
     let preview = std::env::args().any(|arg| arg == "--ui-preview");
     let restore_test = std::env::args().any(|arg| arg == "--restore-test");
+    let _instance = if !smoke && !preview && !restore_test {
+        match instance::Instance::acquire("Local\\AxiomBrowserNormal")? {
+            Some(instance) => Some(instance),
+            None => {
+                unsafe {
+                    MessageBoxW(
+                        std::ptr::null_mut(),
+                        wide("Браузер уже запущен. Используйте открытое окно.").as_ptr(),
+                        wide("Axiom Browser").as_ptr(),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
     if smoke || restore_test {
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(60));
@@ -827,6 +930,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         restore_test,
         restore_step: 0,
         restore_done: false,
+        preferences: Default::default(),
+        form_token: internal::nonce()?,
+        restore_bookmark: 0,
     };
     event_loop.run_app(&mut app)?;
     if app.failed || (app.smoke && !app.smoke_done) {

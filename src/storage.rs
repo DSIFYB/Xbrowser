@@ -4,6 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use url::Url;
 
+use crate::settings::{SearchEngine, Settings};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SavedTab {
     pub url: String,
@@ -47,6 +49,10 @@ impl Store {
                  value INTEGER NOT NULL
              );
              INSERT OR IGNORE INTO meta (key, value) VALUES ('active_index', 0);
+             CREATE TABLE IF NOT EXISTS preferences (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS history (
                  id INTEGER PRIMARY KEY,
                  url TEXT NOT NULL,
@@ -127,6 +133,56 @@ impl Store {
         transaction.commit()
     }
 
+    pub fn settings(&self) -> rusqlite::Result<Settings> {
+        let mut settings = Settings::default();
+        let mut statement = self
+            .connection
+            .prepare("SELECT key, value FROM preferences")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let values = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+        for (key, value) in values {
+            match key.as_str() {
+                "restore_session" => settings.restore_session = parse_bool_pref(&value)?,
+                "lazy_restore" => settings.lazy_restore = parse_bool_pref(&value)?,
+                "search_engine" => {
+                    settings.search_engine =
+                        SearchEngine::from_key(&value).ok_or_else(invalid_settings_error)?;
+                }
+                "confirm_close_multiple" => {
+                    settings.confirm_close_multiple = parse_bool_pref(&value)?;
+                }
+                "home_url" => settings.home_url = value,
+                _ => {}
+            }
+        }
+        settings.validate().map_err(|_| invalid_settings_error())?;
+        Ok(settings)
+    }
+
+    pub fn save_settings(&self, settings: &Settings) -> rusqlite::Result<()> {
+        settings.validate().map_err(|_| invalid_settings_error())?;
+        self.connection.execute(
+            "INSERT INTO preferences (key, value) VALUES
+                 ('restore_session', ?1),
+                 ('lazy_restore', ?2),
+                 ('search_engine', ?3),
+                 ('confirm_close_multiple', ?4),
+                 ('home_url', ?5)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![
+                settings.restore_session.to_string(),
+                settings.lazy_restore.to_string(),
+                settings.search_engine.key(),
+                settings.confirm_close_multiple.to_string(),
+                settings.home_url,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn add_visit(&self, url: &str, title: &str) -> rusqlite::Result<()> {
         ensure_history_url(url)?;
         self.connection.execute(
@@ -153,7 +209,7 @@ impl Store {
     }
 
     pub fn toggle_bookmark(&self, url: &str, title: &str) -> rusqlite::Result<bool> {
-        ensure_allowed_url(url)?;
+        ensure_external_url(url)?;
         let existing: Option<i64> = self
             .connection
             .query_row("SELECT id FROM bookmarks WHERE url = ?1", [url], |row| {
@@ -189,6 +245,38 @@ impl Store {
             .query_map([], row_to_entry)?
             .collect::<rusqlite::Result<Vec<_>>>();
         entries
+    }
+
+    pub fn bookmark(&self, id: i64) -> rusqlite::Result<Option<Entry>> {
+        self.connection
+            .query_row(
+                "SELECT id, url, title, saved_at FROM bookmarks WHERE id = ?1",
+                [id],
+                row_to_entry,
+            )
+            .optional()
+    }
+
+    pub fn update_bookmark(&self, id: i64, url: &str, title: &str) -> rusqlite::Result<()> {
+        ensure_external_url(url)?;
+        let updated = self.connection.execute(
+            "UPDATE bookmarks SET url = ?1, title = ?2 WHERE id = ?3",
+            params![url, title, id],
+        )?;
+        if updated == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
+    }
+
+    pub fn remove_bookmark(&self, id: i64) -> rusqlite::Result<()> {
+        let removed = self
+            .connection
+            .execute("DELETE FROM bookmarks WHERE id = ?1", [id])?;
+        if removed == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
     }
 }
 
@@ -230,8 +318,8 @@ fn is_allowed_url(value: &str) -> bool {
         .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
 }
 
-fn ensure_allowed_url(value: &str) -> rusqlite::Result<()> {
-    if is_allowed_url(value) {
+fn ensure_external_url(value: &str) -> rusqlite::Result<()> {
+    if is_external(value) {
         Ok(())
     } else {
         Err(invalid_url_error())
@@ -259,6 +347,18 @@ fn invalid_url_error() -> rusqlite::Error {
     rusqlite::Error::InvalidParameterName("url".to_string())
 }
 
+fn parse_bool_pref(value: &str) -> rusqlite::Result<bool> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(invalid_settings_error()),
+    }
+}
+
+fn invalid_settings_error() -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName("settings".to_string())
+}
+
 fn now_unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -269,6 +369,7 @@ fn now_unix_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{SavedTab, Session, Store};
+    use crate::settings::{SearchEngine, Settings};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -412,6 +513,55 @@ mod tests {
             .unwrap();
         assert_eq!(store.load_session().unwrap().tabs[0].url, "about:blank");
         assert!(store.history().unwrap().is_empty());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_persist_when_database_is_reopened() {
+        let path = database_path();
+        let settings = Settings {
+            restore_session: false,
+            lazy_restore: true,
+            search_engine: SearchEngine::DuckDuckGo,
+            confirm_close_multiple: true,
+            home_url: "https://example.com/home".into(),
+        };
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.settings().unwrap(), Settings::default());
+            store.save_settings(&settings).unwrap();
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.settings().unwrap(), settings);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bookmarks_can_be_read_updated_and_removed() {
+        let path = database_path();
+        let store = Store::open(&path).unwrap();
+        assert!(store
+            .toggle_bookmark("https://example.com/", "Example")
+            .unwrap());
+        let entry = store.bookmarks().unwrap().pop().unwrap();
+        assert_eq!(store.bookmark(entry.id).unwrap(), Some(entry.clone()));
+
+        store
+            .update_bookmark(entry.id, "https://example.org/guide", "Guide")
+            .unwrap();
+        let updated = store.bookmark(entry.id).unwrap().unwrap();
+        assert_eq!(updated.url, "https://example.org/guide");
+        assert_eq!(updated.title, "Guide");
+        assert!(store
+            .update_bookmark(entry.id, "about:blank", "Blank")
+            .is_err());
+
+        store.remove_bookmark(entry.id).unwrap();
+        assert!(store.bookmark(entry.id).unwrap().is_none());
+        assert!(store.bookmarks().unwrap().is_empty());
         drop(store);
         let _ = std::fs::remove_file(path);
     }

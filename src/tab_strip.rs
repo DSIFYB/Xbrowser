@@ -80,6 +80,20 @@ struct Layout {
 }
 
 impl TabStrip {
+    pub fn visible_ids(&self) -> Vec<u64> {
+        unsafe {
+            state_ptr(self.hwnd)
+                .as_ref()
+                .map(|state| {
+                    layout(state)
+                        .tabs
+                        .iter()
+                        .map(|tab| state.entries[tab.index].0)
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
     pub fn new(parent: HWND) -> io::Result<Self> {
         register_class()?;
         let instance = unsafe { GetModuleHandleW(ptr::null()) };
@@ -592,10 +606,6 @@ fn keep_active_visible(state: &mut State) {
     else {
         return;
     };
-    if active_index < state.scroll_index {
-        state.scroll_index = active_index;
-        return;
-    }
     let plus_width = button_width(state.scale);
     let total_width: i32 = state
         .entries
@@ -603,6 +613,14 @@ fn keep_active_visible(state: &mut State) {
         .map(|(_, title)| tab_width(title, state.scale))
         .sum();
     let overflow = total_width > state.width - plus_width;
+    if !overflow {
+        state.scroll_index = 0;
+        return;
+    }
+    if active_index < state.scroll_index {
+        state.scroll_index = active_index;
+        return;
+    }
     let left = if overflow {
         button_width(state.scale)
     } else {
@@ -739,5 +757,18 @@ mod tests {
             unsafe { hit_test(&state, layout.plus_x + 8, 20) },
             Some(Hit::New)
         ));
+    }
+    #[test]
+    fn restoring_long_titles_then_expanding_window_reveals_every_tab() {
+        let mut state = tabs(600, 1.0);
+        state.entries.truncate(4);
+        state.active = Some(3);
+        keep_active_visible(&mut state);
+        assert!(state.scroll_index > 0);
+        state.width = 1100;
+        keep_active_visible(&mut state);
+        let layout = layout(&state);
+        assert_eq!(state.scroll_index, 0);
+        assert_eq!(layout.tabs.len(), 4);
     }
 }

@@ -9,7 +9,8 @@ pub fn show(hwnd: HWND) -> Option<Action> {
         for (id, label) in [
             (100, "История\tCtrl+H"),
             (101, "Закладки\tCtrl+Shift+O"),
-            (102, "Добавить / удалить закладку\tCtrl+D"),
+            (102, "Сохранить / изменить закладку\tCtrl+D"),
+            (103, "Настройки"),
         ] {
             AppendMenuW(menu, MF_STRING, id, wide(label).as_ptr());
         }
@@ -29,6 +30,7 @@ pub fn show(hwnd: HWND) -> Option<Action> {
             100 => Some(Action::History),
             101 => Some(Action::Bookmarks),
             102 => Some(Action::ToggleBookmark),
+            103 => Some(Action::Settings),
             _ => None,
         }
     }
