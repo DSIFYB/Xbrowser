@@ -12,4 +12,3 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Wind
 [profile.release]
 strip = true
 lto = "thin"
-
