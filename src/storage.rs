@@ -155,6 +155,11 @@ impl Store {
                     settings.confirm_close_multiple = parse_bool_pref(&value)?;
                 }
                 "home_url" => settings.home_url = value,
+                "page_zoom" => {
+                    settings.page_zoom =
+                        value.parse::<u16>().map_err(|_| invalid_settings_error())?;
+                }
+                "remember_history" => settings.remember_history = parse_bool_pref(&value)?,
                 _ => {}
             }
         }
@@ -170,7 +175,9 @@ impl Store {
                  ('lazy_restore', ?2),
                  ('search_engine', ?3),
                  ('confirm_close_multiple', ?4),
-                 ('home_url', ?5)
+                 ('home_url', ?5),
+                 ('page_zoom', ?6),
+                 ('remember_history', ?7)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![
                 settings.restore_session.to_string(),
@@ -178,6 +185,8 @@ impl Store {
                 settings.search_engine.key(),
                 settings.confirm_close_multiple.to_string(),
                 settings.home_url,
+                settings.page_zoom.to_string(),
+                settings.remember_history.to_string(),
             ],
         )?;
         Ok(())
@@ -526,6 +535,8 @@ mod tests {
             search_engine: SearchEngine::DuckDuckGo,
             confirm_close_multiple: true,
             home_url: "https://example.com/home".into(),
+            page_zoom: 135,
+            remember_history: false,
         };
         {
             let store = Store::open(&path).unwrap();
@@ -535,6 +546,16 @@ mod tests {
         {
             let store = Store::open(&path).unwrap();
             assert_eq!(store.settings().unwrap(), settings);
+            store
+                .connection
+                .execute(
+                    "DELETE FROM preferences WHERE key IN ('page_zoom', 'remember_history')",
+                    [],
+                )
+                .unwrap();
+            let migrated = store.settings().unwrap();
+            assert_eq!(migrated.page_zoom, 100);
+            assert!(migrated.remember_history);
         }
         let _ = std::fs::remove_file(path);
     }

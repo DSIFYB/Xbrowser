@@ -68,13 +68,25 @@ pub fn attach_webview(view: &wry::WebView) -> Result<(), Box<dyn std::error::Err
 }
 
 unsafe fn shortcut(key: usize) -> Option<Action> {
+    if GetKeyState(0x11) >= 0 && GetKeyState(0x12) < 0 {
+        return match key {
+            0x25 => Some(Action::Back),
+            0x27 => Some(Action::Forward),
+            _ => None,
+        };
+    }
+    if key == 0x74 && GetKeyState(0x12) >= 0 {
+        return Some(Action::Reload);
+    }
     if GetKeyState(0x11) >= 0 || GetKeyState(0x12) < 0 {
         return None;
     }
     match key {
+        0x52 => Some(Action::Reload),
         0x48 => Some(Action::History),
         0x4f if GetKeyState(0x10) < 0 => Some(Action::Bookmarks),
         0x44 => Some(Action::ToggleBookmark),
+        0x54 if GetKeyState(0x10) < 0 => Some(Action::ReopenTab),
         0x54 => Some(Action::NewTab),
         0x57 => Some(Action::CloseTab),
         0x4c => Some(Action::FocusAddress),
@@ -87,7 +99,7 @@ unsafe fn shortcut(key: usize) -> Option<Action> {
 unsafe extern "system" fn on_message(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 && wp == PM_REMOVE as usize {
         let msg = &mut *(lp as *mut MSG);
-        if msg.message == WM_KEYDOWN {
+        if msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN {
             if let Some(action) = shortcut(msg.wParam) {
                 send(action);
                 msg.message = WM_NULL;

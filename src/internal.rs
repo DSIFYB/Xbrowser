@@ -93,6 +93,37 @@ fn route(
             return Err("Источник запроса не разрешён".into());
         }
         match path {
+            "/history/clear" => {
+                let form = parse_bookmark_form(request.body(), token, false, false)?;
+                if form.len() != 1 {
+                    return Err("Некорректная форма".into());
+                }
+                store.clear_history().map_err(|err| err.to_string())?;
+                send(Action::HistoryCleared);
+                return redirect("/history");
+            }
+            "/bookmarks/add" => {
+                let form = parse_bookmark_form(request.body(), token, true, false)?;
+                let url = crate::navigation::normalize_address(&form["url"])?;
+                let title = if form["title"].trim().is_empty() {
+                    &url
+                } else {
+                    form["title"].trim()
+                };
+                let existing = store
+                    .bookmarks()
+                    .map_err(|err| err.to_string())?
+                    .into_iter()
+                    .find(|entry| entry.url == url);
+                if let Some(entry) = existing {
+                    store.update_bookmark(entry.id, &url, title)
+                } else {
+                    store.toggle_bookmark(&url, title).map(|_| ())
+                }
+                .map_err(|err| err.to_string())?;
+                send(Action::BookmarksChanged);
+                return redirect("/bookmarks");
+            }
             "/settings/save" => {
                 let (settings, provided) = settings::parse_form(request.body())?;
                 if provided != token {
@@ -105,7 +136,8 @@ fn route(
                 return redirect("/settings?saved=1");
             }
             "/bookmarks/save" | "/bookmarks/delete" => {
-                let form = parse_bookmark_form(request.body(), token, path == "/bookmarks/save")?;
+                let form =
+                    parse_bookmark_form(request.body(), token, path == "/bookmarks/save", true)?;
                 let id = form["id"]
                     .parse::<i64>()
                     .map_err(|_| "Некорректный номер закладки")?;
@@ -161,6 +193,9 @@ fn route(
                 &entries,
                 token,
                 edit,
+                query
+                    .get("delete")
+                    .and_then(|value| value.parse::<i64>().ok()),
             )
         }
         _ => return Err("Страница не найдена".into()),
@@ -182,6 +217,7 @@ fn parse_bookmark_form(
     body: &[u8],
     token: &str,
     editing: bool,
+    requires_id: bool,
 ) -> Result<HashMap<String, String>, String> {
     if body.len() > 16384 {
         return Err("Форма слишком большая".into());
@@ -195,7 +231,7 @@ fn parse_bookmark_form(
         }
     }
     if form.get("token").map(String::as_str) != Some(token)
-        || !form.contains_key("id")
+        || (requires_id && !form.contains_key("id"))
         || (editing && (!form.contains_key("url") || !form.contains_key("title")))
     {
         return Err("Форма устарела или повреждена".into());
@@ -228,8 +264,8 @@ mod tests {
     }
     #[test]
     fn bookmark_forms_reject_missing_token_and_duplicate_ids() {
-        assert!(parse_bookmark_form(b"id=1", "secret", false).is_err());
-        assert!(parse_bookmark_form(b"token=secret&id=1&id=2", "secret", false).is_err());
+        assert!(parse_bookmark_form(b"id=1", "secret", false, true).is_err());
+        assert!(parse_bookmark_form(b"token=secret&id=1&id=2", "secret", false, true).is_err());
     }
     #[test]
     fn home_uses_selected_search_engine() {

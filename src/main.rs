@@ -64,6 +64,12 @@ enum Action {
     BookmarksChanged,
     OpenSaved(String),
     OpenAllBookmarks,
+    ReopenTab,
+    DuplicateTab(TabId),
+    TabMenu(TabId),
+    MoveTab(TabId, isize),
+    CloseOtherTabs(TabId, bool),
+    HistoryCleared,
 }
 static PROXY: OnceLock<EventLoopProxy<Action>> = OnceLock::new();
 static PARENT_PROC: OnceLock<isize> = OnceLock::new();
@@ -183,6 +189,7 @@ struct Browser {
     preferences: settings::Settings,
     form_token: String,
     restore_bookmark: i64,
+    closed_tabs: Vec<storage::SavedTab>,
 }
 impl Browser {
     fn error(&mut self, message: impl std::fmt::Display) {
@@ -211,6 +218,16 @@ impl Browser {
             return Err("Windows is required".into());
         };
         let hwnd = handle.hwnd.get() as HWND;
+        unsafe {
+            let dark = 1i32;
+            // Windows 10/11 draw the standard title bar in the application's dark palette.
+            windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                hwnd,
+                20,
+                (&dark as *const i32).cast(),
+                4,
+            );
+        }
         self.strip = Some(tab_strip::TabStrip::new(hwnd)?);
         let toolbar = toolbar::Toolbar::new(hwnd)?;
         self.edit = toolbar.edit;
@@ -291,9 +308,25 @@ impl Browser {
             self.add_tab(&startup)?;
         }
         if self.preview {
-            self.add_tab("https://example.com/")?;
-            self.add_tab("https://rust-lang.org/")?;
-            self.select_tab(0)?;
+            if std::env::args().any(|arg| arg == "--preview-settings") {
+                self.act(Action::Settings)?;
+            } else if std::env::args().any(|arg| arg == "--preview-bookmarks") {
+                let store = self.store.as_ref().unwrap();
+                if !store.is_bookmarked("https://example.com/")? {
+                    store.toggle_bookmark("https://example.com/", "Example Domain")?;
+                }
+                if !store.is_bookmarked("https://rust-lang.org/")? {
+                    store.toggle_bookmark(
+                        "https://rust-lang.org/",
+                        "Rust — язык программирования",
+                    )?;
+                }
+                self.act(Action::Bookmarks)?;
+            } else {
+                self.add_tab("https://example.com/")?;
+                self.add_tab("https://rust-lang.org/")?;
+                self.select_tab(0)?;
+            }
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 send(Action::CapturePreview);
@@ -365,6 +398,10 @@ impl Browser {
             builder = builder.with_environment(environment);
         }
         let view = builder.build_as_child(self.window.as_ref().ok_or("Window is missing")?)?;
+        unsafe {
+            view.controller()
+                .SetZoomFactor(self.preferences.page_zoom as f64 / 100.0)?;
+        }
         shortcuts::attach_webview(&view)?;
         let mut token = 0;
         unsafe {
@@ -565,7 +602,7 @@ impl Browser {
             }
             Action::CloseTab => {
                 if let Some(id) = self.tabs.active().map(|tab| tab.id) {
-                    self.tabs.close(id);
+                    self.remember_closed(id);
                     if let Some(next) = self.tabs.active().map(|tab| tab.id) {
                         self.ensure_view(next)?;
                     }
@@ -579,7 +616,7 @@ impl Browser {
             Action::SelectTabId(id) => self.select_tab(id)?,
             Action::CloseTabId(id) => {
                 let active = self.tabs.active().map(|tab| tab.id) == Some(id);
-                if self.tabs.close(id).is_some() {
+                if self.remember_closed(id) {
                     if let Some(next) = self.tabs.active().map(|tab| tab.id) {
                         self.ensure_view(next)?;
                     }
@@ -721,8 +758,62 @@ impl Browser {
                     self.act(action)?;
                 }
             }
+            Action::TabMenu(id) => {
+                let RawWindowHandle::Win32(handle) = self
+                    .window
+                    .as_ref()
+                    .ok_or("No window")?
+                    .window_handle()?
+                    .as_raw()
+                else {
+                    return Ok(());
+                };
+                if let Some(action) = menu::show_tab(handle.hwnd.get() as HWND, id) {
+                    self.act(action)?;
+                }
+            }
+            Action::ReopenTab => {
+                if let Some(saved) = self.closed_tabs.pop() {
+                    self.add_tab(&saved.url)?;
+                }
+            }
+            Action::DuplicateTab(id) => {
+                if let Some(url) = self
+                    .tabs
+                    .entries()
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.value.url.clone())
+                {
+                    self.add_tab(&url)?;
+                }
+            }
+            Action::MoveTab(id, offset) => {
+                self.tabs.move_by(id, offset);
+                self.sync_tabs()?;
+            }
+            Action::CloseOtherTabs(id, right_only) => {
+                if let Some(index) = self.tabs.entries().iter().position(|t| t.id == id) {
+                    let ids = self
+                        .tabs
+                        .entries()
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, t)| t.id != id && (!right_only || *i > index))
+                        .map(|(_, t)| t.id)
+                        .collect::<Vec<_>>();
+                    for other in ids {
+                        self.remember_closed(other);
+                    }
+                    if let Some(active) = self.tabs.active().map(|t| t.id) {
+                        self.ensure_view(active)?;
+                    }
+                    self.sync_tabs()?;
+                    self.set_address();
+                }
+            }
             Action::Completed(id, url, success) => {
-                if success && storage::is_external(&url) {
+                if success && self.preferences.remember_history && storage::is_external(&url) {
                     if let (Some(store), Some(tab)) = (
                         &self.store,
                         self.tabs.entries().iter().find(|tab| tab.id == id),
@@ -736,6 +827,12 @@ impl Browser {
             Action::SettingsChanged => {
                 self.preferences = self.store.as_ref().ok_or("No store")?.settings()?;
                 for tab in self.tabs.entries() {
+                    if let Some(view) = &tab.value.view {
+                        unsafe {
+                            view.controller()
+                                .SetZoomFactor(self.preferences.page_zoom as f64 / 100.0)?;
+                        }
+                    }
                     if tab.value.url == "about:blank" {
                         if let Some(view) = &tab.value.view {
                             unsafe {
@@ -746,6 +843,17 @@ impl Browser {
                 }
             }
             Action::BookmarksChanged => self.sync_tabs()?,
+            Action::HistoryCleared => {
+                for tab in self.tabs.entries() {
+                    if tab.value.url.starts_with("http://axiom.localhost/history") {
+                        if let Some(view) = &tab.value.view {
+                            unsafe {
+                                view.webview().Reload()?;
+                            }
+                        }
+                    }
+                }
+            }
             Action::OpenSaved(url) => self.add_tab(&url)?,
             Action::OpenAllBookmarks => {
                 let entries = self.store.as_ref().ok_or("No store")?.bookmarks()?;
@@ -756,6 +864,21 @@ impl Browser {
         }
         self.persist()?;
         Ok(())
+    }
+    fn remember_closed(&mut self, id: TabId) -> bool {
+        if let Some(tab) = self.tabs.close(id) {
+            self.closed_tabs.push(storage::SavedTab {
+                url: tab.url,
+                title: tab.title,
+                pinned: tab.pinned,
+            });
+            if self.closed_tabs.len() > 20 {
+                self.closed_tabs.remove(0);
+            }
+            true
+        } else {
+            false
+        }
     }
     fn select_tab(&mut self, id: TabId) -> Result<(), Box<dyn Error>> {
         self.ensure_view(id)?;
@@ -841,8 +964,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::fs::create_dir_all(&root)?;
         let mut store = storage::Store::open(&root.join("browser.sqlite3"))?;
         store.clear_history()?;
-        if store.is_bookmarked("https://rust-lang.org/")? {
-            store.toggle_bookmark("https://rust-lang.org/", "Rust")?;
+        for entry in store.bookmarks()? {
+            store.remove_bookmark(entry.id)?;
         }
         store.save_session(&storage::Session {
             active: 3,
@@ -933,6 +1056,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         preferences: Default::default(),
         form_token: internal::nonce()?,
         restore_bookmark: 0,
+        closed_tabs: Vec::new(),
     };
     event_loop.run_app(&mut app)?;
     if app.failed || (app.smoke && !app.smoke_done) {

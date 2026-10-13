@@ -6,7 +6,9 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::{
-            DRAWITEMSTRUCT, EM_SETCUEBANNER, EM_SETMARGINS, ODS_DISABLED, ODS_SELECTED,
+            InitCommonControlsEx, DRAWITEMSTRUCT, EM_SETCUEBANNER, EM_SETMARGINS,
+            ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, ODS_DISABLED, ODS_SELECTED, TTF_IDISHWND,
+            TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTS_ALWAYSTIP, TTTOOLINFOW,
             WM_MOUSELEAVE,
         },
         HiDpi::GetDpiForWindow,
@@ -23,6 +25,7 @@ pub struct Toolbar {
     pub edit: HWND,
     buttons: [HWND; 6],
     font: HFONT,
+    tip_text: Vec<Vec<u16>>,
 }
 fn rgb(r: u32, g: u32, b: u32) -> u32 {
     r | g << 8 | b << 16
@@ -36,6 +39,10 @@ impl Toolbar {
         let mut buttons = [ptr::null_mut(); 6];
         unsafe {
             let instance = GetModuleHandleW(ptr::null());
+            InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+                dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_WIN95_CLASSES,
+            });
             for (index, id) in [1, 2, 3, 5, 10, 9].into_iter().enumerate() {
                 buttons[index] = CreateWindowExW(
                     0,
@@ -87,10 +94,55 @@ impl Toolbar {
                 (EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize,
                 0,
             );
+            let tip_text = [
+                "Назад (Alt+←)",
+                "Вперёд (Alt+→)",
+                "Обновить страницу",
+                "Перейти по адресу",
+                "Сохранить / изменить закладку (Ctrl+D)",
+                "Меню браузера",
+            ]
+            .iter()
+            .map(|text| wide(text))
+            .collect::<Vec<_>>();
+            let tooltip = CreateWindowExW(
+                WS_EX_TOPMOST,
+                wide("tooltips_class32").as_ptr(),
+                ptr::null(),
+                WS_POPUP | TTS_ALWAYSTIP,
+                0,
+                0,
+                0,
+                0,
+                parent,
+                ptr::null_mut(),
+                instance,
+                ptr::null(),
+            );
+            if !tooltip.is_null() {
+                SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, 320);
+                for (index, button) in buttons.iter().enumerate() {
+                    let info = TTTOOLINFOW {
+                        cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                        uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+                        hwnd: parent,
+                        uId: *button as usize,
+                        lpszText: tip_text[index].as_ptr() as *mut u16,
+                        ..std::mem::zeroed()
+                    };
+                    SendMessageW(
+                        tooltip,
+                        TTM_ADDTOOLW,
+                        0,
+                        (&info as *const TTTOOLINFOW) as isize,
+                    );
+                }
+            }
             Ok(Self {
                 edit,
                 buttons,
                 font: ptr::null_mut(),
+                tip_text,
             })
         }
     }
@@ -172,6 +224,8 @@ impl Drop for Toolbar {
             if !self.font.is_null() {
                 DeleteObject(self.font);
             }
+            // Keep tooltip strings alive until after the owning window destroys its controls.
+            self.tip_text.clear();
         }
     }
 }
@@ -182,14 +236,16 @@ pub unsafe fn paint(hwnd: HWND) {
     let mut client: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut client);
     let scale = GetDpiForWindow(hwnd).max(96) as f64 / 96.0;
-    FillRect(dc, &client, GetStockObject(WHITE_BRUSH) as HBRUSH);
+    let base = CreateSolidBrush(rgb(13, 15, 20));
+    FillRect(dc, &client, base);
+    DeleteObject(base);
     let bar = RECT {
         left: 0,
         top: px(44.0, scale),
         right: client.right,
         bottom: px(HEIGHT, scale),
     };
-    let bg = CreateSolidBrush(rgb(248, 250, 253));
+    let bg = CreateSolidBrush(rgb(24, 28, 37));
     FillRect(dc, &bar, bg);
     DeleteObject(bg);
     let focused = GetFocus() == GetDlgItem(hwnd, 4);
@@ -197,13 +253,14 @@ pub unsafe fn paint(hwnd: HWND) {
         PS_SOLID,
         px(1.0, scale),
         if focused {
-            rgb(108, 149, 235)
+            rgb(182, 173, 255)
         } else {
-            rgb(226, 231, 240)
+            rgb(56, 65, 86)
         },
     );
     let old_pen = SelectObject(dc, pen);
-    let old_brush = SelectObject(dc, GetStockObject(WHITE_BRUSH));
+    let field = CreateSolidBrush(rgb(35, 41, 56));
+    let old_brush = SelectObject(dc, field);
     RoundRect(
         dc,
         px(146.0, scale),
@@ -215,8 +272,9 @@ pub unsafe fn paint(hwnd: HWND) {
     );
     SelectObject(dc, old_pen);
     SelectObject(dc, old_brush);
+    DeleteObject(field);
     DeleteObject(pen);
-    let pen = CreatePen(PS_SOLID, px(1.5, scale), rgb(131, 144, 164));
+    let pen = CreatePen(PS_SOLID, px(1.5, scale), rgb(170, 180, 200));
     let old = SelectObject(dc, pen);
     let brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
     Ellipse(
@@ -231,7 +289,7 @@ pub unsafe fn paint(hwnd: HWND) {
     SelectObject(dc, old);
     SelectObject(dc, brush);
     DeleteObject(pen);
-    let pen = CreatePen(PS_SOLID, 1, rgb(230, 234, 241));
+    let pen = CreatePen(PS_SOLID, 1, rgb(56, 65, 86));
     let old = SelectObject(dc, pen);
     MoveToEx(dc, 0, bar.bottom - 1, ptr::null_mut());
     LineTo(dc, client.right, bar.bottom - 1);
@@ -240,9 +298,10 @@ pub unsafe fn paint(hwnd: HWND) {
     EndPaint(hwnd, &ps);
 }
 pub unsafe fn color_edit(dc: HDC) -> LRESULT {
-    SetTextColor(dc, rgb(42, 54, 76));
-    SetBkColor(dc, rgb(255, 255, 255));
-    GetStockObject(WHITE_BRUSH) as LRESULT
+    SetTextColor(dc, rgb(237, 240, 247));
+    SetBkColor(dc, rgb(35, 41, 56));
+    SetDCBrushColor(dc, rgb(35, 41, 56));
+    GetStockObject(DC_BRUSH) as LRESULT
 }
 pub unsafe fn paint_placeholder(hwnd: HWND) {
     if GetWindowTextLengthW(hwnd) != 0 || GetFocus() == hwnd {
@@ -254,7 +313,7 @@ pub unsafe fn paint_placeholder(hwnd: HWND) {
     let font = SendMessageW(hwnd, WM_GETFONT, 0, 0);
     let old = SelectObject(dc, font as _);
     SetBkMode(dc, TRANSPARENT as i32);
-    SetTextColor(dc, rgb(142, 151, 167));
+    SetTextColor(dc, rgb(170, 180, 200));
     DrawTextW(
         dc,
         wide("Введите адрес или поисковый запрос").as_ptr(),
@@ -268,19 +327,20 @@ pub unsafe fn paint_placeholder(hwnd: HWND) {
 pub unsafe fn draw_button(item: &DRAWITEMSTRUCT) {
     let scale = GetDpiForWindow(item.hwndItem).max(96) as f64 / 96.0;
     let dc = item.hDC;
+    let saved_dc = SaveDC(dc);
     let rect = item.rcItem;
     let mut cursor = POINT { x: 0, y: 0 };
     GetCursorPos(&mut cursor);
     ScreenToClient(item.hwndItem, &mut cursor);
     let hover = cursor.x >= 0 && cursor.y >= 0 && cursor.x < rect.right && cursor.y < rect.bottom;
-    let bg = CreateSolidBrush(rgb(248, 250, 253));
+    let bg = CreateSolidBrush(rgb(24, 28, 37));
     FillRect(dc, &rect, bg);
     DeleteObject(bg);
     if hover || item.itemState & ODS_SELECTED != 0 {
         let bg = CreateSolidBrush(if item.itemState & ODS_SELECTED != 0 {
-            rgb(217, 226, 240)
+            rgb(35, 41, 56)
         } else {
-            rgb(232, 237, 245)
+            rgb(44, 52, 70)
         });
         let old = SelectObject(dc, bg);
         let oldp = SelectObject(dc, GetStockObject(NULL_PEN));
@@ -298,9 +358,9 @@ pub unsafe fn draw_button(item: &DRAWITEMSTRUCT) {
         DeleteObject(bg);
     }
     let color = if item.itemState & ODS_DISABLED != 0 {
-        rgb(185, 193, 206)
+        rgb(97, 109, 134)
     } else {
-        rgb(76, 91, 114)
+        rgb(170, 180, 200)
     };
     let pen = CreatePen(PS_SOLID, px(1.7, scale), color);
     let oldp = SelectObject(dc, pen);
@@ -326,42 +386,33 @@ pub unsafe fn draw_button(item: &DRAWITEMSTRUCT) {
         10 => {
             let mut text = [0u16; 3];
             GetWindowTextW(item.hwndItem, text.as_mut_ptr(), 3);
-            SetTextColor(
+            let saved = text[0] == 0x2605;
+            let star_color = if saved { rgb(182, 173, 255) } else { color };
+            let star_pen = CreatePen(PS_SOLID, px(1.7, scale), star_color);
+            let old_pen = SelectObject(dc, star_pen);
+            let fill = CreateSolidBrush(star_color);
+            let old_brush = SelectObject(
                 dc,
-                if text[0] == 0x2605 {
-                    rgb(55, 104, 218)
+                if saved {
+                    fill
                 } else {
-                    color
+                    GetStockObject(NULL_BRUSH)
                 },
             );
-            SetBkMode(dc, TRANSPARENT as i32);
-            let font = CreateFontW(
-                -px(24.0, scale),
-                0,
-                0,
-                0,
-                400,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET as u32,
-                0,
-                0,
-                CLEARTYPE_QUALITY as u32,
-                0,
-                wide("Segoe UI").as_ptr(),
-            );
-            let old = SelectObject(dc, font);
-            let mut rect = item.rcItem;
-            DrawTextW(
-                dc,
-                text.as_ptr(),
-                -1,
-                &mut rect,
-                DT_SINGLELINE | DT_CENTER | DT_VCENTER,
-            );
-            SelectObject(dc, old);
-            DeleteObject(font);
+            let points = std::array::from_fn::<_, 10, _>(|index| {
+                let angle =
+                    -std::f64::consts::FRAC_PI_2 + index as f64 * std::f64::consts::PI / 5.0;
+                let radius = px(if index % 2 == 0 { 9.0 } else { 4.0 }, scale) as f64;
+                POINT {
+                    x: x + (angle.cos() * radius).round() as i32,
+                    y: y + (angle.sin() * radius).round() as i32,
+                }
+            });
+            Polygon(dc, points.as_ptr(), 10);
+            SelectObject(dc, old_brush);
+            SelectObject(dc, old_pen);
+            DeleteObject(fill);
+            DeleteObject(star_pen);
         }
         9 => {
             let brush = CreateSolidBrush(color);
@@ -384,6 +435,7 @@ pub unsafe fn draw_button(item: &DRAWITEMSTRUCT) {
     SelectObject(dc, oldp);
     SelectObject(dc, oldb);
     DeleteObject(pen);
+    RestoreDC(dc, saved_dc);
 }
 unsafe extern "system" fn button_proc(
     hwnd: HWND,
