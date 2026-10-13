@@ -1,8 +1,19 @@
 mod navigation;
+mod shortcuts;
+mod smoke;
+mod tab_strip;
+mod tabs;
 
 use std::{error::Error, sync::OnceLock};
+use tabs::{TabId, TabSet};
 use windows_sys::Win32::{
-    Foundation::*, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*,
+    Foundation::*,
+    System::LibraryLoader::GetModuleHandleW,
+    UI::{
+        Controls::EM_SETSEL,
+        Input::KeyboardAndMouse::{GetFocus, SetFocus},
+        WindowsAndMessaging::*,
+    },
 };
 use winit::{
     application::ApplicationHandler,
@@ -13,7 +24,7 @@ use winit::{
 };
 use wry::{
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
-    Rect, WebContext, WebView, WebViewBuilder, WebViewExtWindows,
+    Rect, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows,
 };
 
 #[derive(Debug)]
@@ -22,8 +33,14 @@ enum Action {
     Back,
     Forward,
     Reload,
-    Loaded(String),
-    Verified(String),
+    NewTab,
+    CloseTab,
+    SelectTab,
+    FocusAddress,
+    NextTab(bool),
+    Loaded(TabId, String),
+    Title(TabId, String),
+    Verified(TabId, String),
     Timeout,
 }
 static PROXY: OnceLock<EventLoopProxy<Action>> = OnceLock::new();
@@ -46,8 +63,13 @@ unsafe extern "system" fn parent_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             2 => send(Action::Forward),
             3 => send(Action::Reload),
             5 => send(Action::Navigate),
+            6 => send(Action::NewTab),
+            7 => send(Action::CloseTab),
             _ => {}
         }
+    }
+    if msg == WM_COMMAND && (wp & 0xffff) == 8 && (wp >> 16) == CBN_SELCHANGE as usize {
+        send(Action::SelectTab);
     }
     CallWindowProcW(
         std::mem::transmute::<isize, WNDPROC>(*PARENT_PROC.get().unwrap()),
@@ -74,15 +96,23 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     )
 }
 
+struct Tab {
+    view: WebView,
+    url: String,
+    title: String,
+}
 struct Browser {
-    view: Option<WebView>,
+    tabs: TabSet<Tab>,
+    shortcuts: Option<shortcuts::Shortcuts>,
     context: Option<WebContext>,
     window: Option<Window>,
+    strip: Option<tab_strip::TabStrip>,
     edit: HWND,
     go: HWND,
     smoke: bool,
     loads: usize,
     failed: bool,
+    smoke_done: bool,
 }
 impl Browser {
     fn error(&mut self, message: impl std::fmt::Display) {
@@ -103,7 +133,7 @@ impl Browser {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
         let window = event_loop.create_window(
             Window::default_attributes()
-                .with_title("Axiom Browser 0.1")
+                .with_title("Axiom Browser 0.1.1")
                 .with_inner_size(PhysicalSize::new(1100, 760))
                 .with_min_inner_size(PhysicalSize::new(500, 300)),
         )?;
@@ -111,6 +141,7 @@ impl Browser {
             return Err("Windows is required".into());
         };
         let hwnd = handle.hwnd.get() as HWND;
+        self.strip = Some(tab_strip::TabStrip::new(hwnd)?);
         unsafe {
             let instance = GetModuleHandleW(std::ptr::null());
             for (id, label, x) in [(1, "Back", 8), (2, "Forward", 80), (3, "Reload", 152)] {
@@ -190,50 +221,106 @@ impl Browser {
         };
         std::fs::create_dir_all(&profile)?;
         self.context = Some(WebContext::new(Some(profile)));
-        let view = WebViewBuilder::new_with_web_context(self.context.as_mut().unwrap())
-            .with_url("https://example.com/")
-            .with_bounds(Rect {
-                position: wry::dpi::PhysicalPosition::new(0, 44).into(),
-                size: wry::dpi::PhysicalSize::new(1100, 716).into(),
-            })
-            .with_navigation_handler(|url| {
-                url == "about:blank" || navigation::normalize_address(&url).is_ok()
-            })
-            .with_permission_handler(|_| wry::PermissionResponse::Deny)
-            .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
-            .with_on_page_load_handler(|event, url| {
-                if matches!(event, wry::PageLoadEvent::Finished) {
-                    send(Action::Loaded(url));
-                }
-            })
-            .build_as_child(&window)?;
-        self.view = Some(view);
         self.window = Some(window);
+        self.shortcuts = Some(shortcuts::Shortcuts::install()?);
+        self.add_tab("https://example.com/")?;
+        Ok(())
+    }
+    fn add_tab(&mut self, url: &str) -> Result<(), Box<dyn Error>> {
+        let id = self.tabs.next_id();
+        // All tabs explicitly reuse the first tab's COM environment and default profile.
+        let environment = self
+            .tabs
+            .entries()
+            .first()
+            .map(|tab| tab.value.view.environment());
+        let mut builder = WebViewBuilder::new_with_web_context(
+            self.context.as_mut().ok_or("Profile is missing")?,
+        )
+        .with_url(url)
+        .with_visible(false)
+        .with_bounds(Rect {
+            position: wry::dpi::PhysicalPosition::new(0, 80).into(),
+            size: wry::dpi::PhysicalSize::new(1100, 680).into(),
+        })
+        .with_navigation_handler(|url| {
+            url == "about:blank" || navigation::normalize_address(&url).is_ok()
+        })
+        .with_permission_handler(|_| wry::PermissionResponse::Deny)
+        .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
+        .with_document_title_changed_handler(move |title| send(Action::Title(id, title)))
+        .with_on_page_load_handler(move |event, url| {
+            if matches!(event, wry::PageLoadEvent::Finished) {
+                send(Action::Loaded(id, url));
+            }
+        });
+        if let Some(environment) = environment {
+            builder = builder.with_environment(environment);
+        }
+        let view = builder.build_as_child(self.window.as_ref().ok_or("Window is missing")?)?;
+        shortcuts::attach_webview(&view)?;
+        self.tabs.add(Tab {
+            view,
+            url: url.into(),
+            title: "Loading…".into(),
+        });
+        self.sync_tabs()?;
+        self.set_address();
         self.resize()?;
         Ok(())
     }
+    fn sync_tabs(&self) -> Result<(), Box<dyn Error>> {
+        let active = self.tabs.active().map(|tab| tab.id);
+        for tab in self.tabs.entries() {
+            tab.value.view.set_visible(Some(tab.id) == active)?;
+        }
+        if let Some(strip) = &self.strip {
+            let labels = self
+                .tabs
+                .entries()
+                .iter()
+                .map(|tab| (tab.id, tab.value.title.clone()))
+                .collect::<Vec<_>>();
+            strip.update(&labels, active)?;
+        }
+        if let Some(tab) = self.tabs.active() {
+            if let Some(window) = &self.window {
+                window.set_title(&format!("{} — Axiom Browser 0.1.1", tab.value.title));
+            }
+        }
+        Ok(())
+    }
+    fn set_address(&self) {
+        if let Some(tab) = self.tabs.active() {
+            unsafe {
+                SetWindowTextW(self.edit, wide(&tab.value.url).as_ptr());
+            }
+        }
+    }
     fn resize(&self) -> wry::Result<()> {
-        if let (Some(window), Some(view)) = (&self.window, &self.view) {
+        if let Some(window) = &self.window {
             let size = window.inner_size();
             unsafe {
                 MoveWindow(self.edit, 228, 8, (size.width as i32 - 316).max(80), 28, 1);
                 MoveWindow(self.go, size.width as i32 - 80, 8, 70, 28, 1);
             }
-            view.set_bounds(Rect {
-                position: wry::dpi::PhysicalPosition::new(0, 44).into(),
-                size: wry::dpi::PhysicalSize::new(
-                    size.width.max(1),
-                    size.height.saturating_sub(44).max(1),
-                )
-                .into(),
-            })?;
+            if let Some(strip) = &self.strip {
+                strip.resize(size.width);
+            }
+            for tab in self.tabs.entries() {
+                tab.value.view.set_bounds(Rect {
+                    position: wry::dpi::PhysicalPosition::new(0, 80).into(),
+                    size: wry::dpi::PhysicalSize::new(
+                        size.width.max(1),
+                        size.height.saturating_sub(80).max(1),
+                    )
+                    .into(),
+                })?;
+            }
         }
         Ok(())
     }
     fn act(&mut self, action: Action) -> Result<(), Box<dyn Error>> {
-        let Some(view) = &self.view else {
-            return Ok(());
-        };
         match action {
             Action::Navigate => {
                 let input = unsafe {
@@ -243,62 +330,125 @@ impl Browser {
                     String::from_utf16_lossy(&text[..count as usize])
                 };
                 let url = navigation::normalize_address(&input)?;
-                view.load_url(&url)?;
-                view.focus()?;
+                let tab = self.tabs.active_mut().ok_or("No active tab")?;
+                tab.value.view.load_url(&url)?;
+                tab.value.url = url;
+                tab.value.view.focus()?;
             }
             Action::Back => unsafe {
-                view.webview().GoBack()?;
+                let view = &self.tabs.active().ok_or("No active tab")?.value.view;
+                let mut allowed = Default::default();
+                view.webview().CanGoBack(&mut allowed)?;
+                if allowed.as_bool() {
+                    view.webview().GoBack()?;
+                }
             },
             Action::Forward => unsafe {
-                view.webview().GoForward()?;
+                let view = &self.tabs.active().ok_or("No active tab")?.value.view;
+                let mut allowed = Default::default();
+                view.webview().CanGoForward(&mut allowed)?;
+                if allowed.as_bool() {
+                    view.webview().GoForward()?;
+                }
             },
             Action::Reload => unsafe {
-                view.webview().Reload()?;
+                self.tabs
+                    .active()
+                    .ok_or("No active tab")?
+                    .value
+                    .view
+                    .webview()
+                    .Reload()?;
             },
-            Action::Loaded(url) => {
-                unsafe {
-                    SetWindowTextW(self.edit, wide(&url).as_ptr());
+            Action::NewTab => {
+                self.add_tab("about:blank")?;
+                self.act(Action::FocusAddress)?;
+            }
+            Action::CloseTab => {
+                if let Some(id) = self.tabs.active().map(|tab| tab.id) {
+                    self.tabs.close(id);
+                    self.sync_tabs()?;
+                    self.set_address();
                 }
-                if self.smoke {
-                    println!("PAGE_LOADED {url}");
-                    view.evaluate_script_with_callback("JSON.stringify({title:document.title,url:location.href,text:document.body.innerText.slice(0,500)})", |result| println!("PAGE_DIAGNOSTIC {result}"))?;
-                    let check = if self.loads == 0 {
-                        "location.hostname === 'example.com' && document.title === 'Example Domain' && document.body.innerText.length > 100"
-                    } else if self.loads == 2 {
-                        "location.hostname === 'example.com' && document.title === 'Example Domain' && document.body.innerText.length > 100"
-                    } else {
-                        "location.hostname.endsWith('rust-lang.org') && document.body.innerText.includes('Rust')"
-                    };
-                    view.evaluate_script_with_callback(check, |result| {
-                        send(Action::Verified(result))
-                    })?;
+                if let Some(tab) = self.tabs.active() {
+                    tab.value.view.focus()?;
                 }
             }
-            Action::Verified(result) => {
+            Action::SelectTab => {
+                if let Some(id) = self.strip.as_ref().and_then(|strip| strip.selected_id()) {
+                    self.select_tab(id)?;
+                }
+            }
+            Action::NextTab(reverse) => {
+                if let Some(index) = self
+                    .tabs
+                    .entries()
+                    .iter()
+                    .position(|tab| Some(tab.id) == self.tabs.active().map(|tab| tab.id))
+                {
+                    let count = self.tabs.len();
+                    let next = if reverse {
+                        (index + count - 1) % count
+                    } else {
+                        (index + 1) % count
+                    };
+                    self.select_tab(self.tabs.entries()[next].id)?;
+                }
+            }
+            Action::FocusAddress => unsafe {
+                SetFocus(self.edit);
+                SendMessageW(self.edit, EM_SETSEL, 0, -1);
+            },
+            Action::Title(id, title) => {
+                if let Some(tab) = self.tabs.get_mut(id) {
+                    tab.value.title = if title.trim().is_empty() {
+                        "New tab".into()
+                    } else {
+                        title
+                    };
+                    self.sync_tabs()?;
+                }
+            }
+            Action::Loaded(id, url) => {
+                let Some(tab) = self.tabs.get_mut(id) else {
+                    return Ok(());
+                };
+                tab.value.url = url.clone();
+                self.sync_tabs()?;
+                if self.tabs.active().map(|tab| tab.id) == Some(id)
+                    && unsafe { GetFocus() } != self.edit
+                {
+                    self.set_address();
+                }
+                if self.smoke && self.tabs.active().map(|tab| tab.id) == Some(id) {
+                    println!("PAGE_LOADED tab={id} {url}");
+                    self.check_smoke_page(id)?;
+                }
+            }
+            Action::Verified(id, result) => {
+                if self.tabs.active().map(|tab| tab.id) != Some(id) {
+                    return Ok(());
+                }
                 if result != "true" {
-                    return Err(format!("Page content verification failed: {result}").into());
+                    return Err(format!(
+                        "Page verification failed at step {}: {result}",
+                        self.loads
+                    )
+                    .into());
                 }
                 self.loads += 1;
-                println!("CONTENT_VERIFIED {}", self.loads);
-                match self.loads {
-                    1 => {
-                        unsafe {
-                            SetWindowTextW(self.edit, wide("https://www.rust-lang.org/").as_ptr());
-                        }
-                        self.act(Action::Navigate)?;
-                    }
-                    2 => {
-                        if let Some(window) = &self.window {
-                            let _ = window.request_inner_size(PhysicalSize::new(900, 600));
-                        }
-                        self.act(Action::Back)?;
-                    }
-                    3 => self.act(Action::Forward)?,
-                    4 => self.act(Action::Reload)?,
-                    _ => {}
-                }
+                println!("CONTENT_VERIFIED step={} tab={id}", self.loads);
+                self.advance_smoke()?;
             }
             Action::Timeout => {}
+        }
+        Ok(())
+    }
+    fn select_tab(&mut self, id: TabId) -> Result<(), Box<dyn Error>> {
+        if self.tabs.select(id) {
+            self.sync_tabs()?;
+            self.set_address();
+            self.tabs.active().unwrap().value.view.focus()?;
         }
         Ok(())
     }
@@ -333,7 +483,7 @@ impl ApplicationHandler<Action> for Browser {
         if let Err(err) = self.act(action) {
             self.error(err);
         }
-        if self.smoke && (self.loads >= 5 || self.failed) {
+        if self.tabs.len() == 0 || (self.smoke && (self.smoke_done || self.failed)) {
             event_loop.exit();
         }
     }
@@ -351,17 +501,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         });
     }
     let mut app = Browser {
-        view: None,
+        tabs: TabSet::new(),
+        shortcuts: None,
         context: None,
         window: None,
+        strip: None,
         edit: std::ptr::null_mut(),
         go: std::ptr::null_mut(),
         smoke,
         loads: 0,
         failed: false,
+        smoke_done: false,
     };
     event_loop.run_app(&mut app)?;
-    if app.failed {
+    if app.failed || (app.smoke && !app.smoke_done) {
         std::process::exit(1);
     }
     Ok(())
