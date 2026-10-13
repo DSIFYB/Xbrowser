@@ -87,6 +87,16 @@ impl<T> TabSet<T> {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn move_by(&mut self, id: TabId, offset: isize) {
+        if let Some(index) = self.entries.iter().position(|tab| tab.id == id) {
+            let target = index
+                .saturating_add_signed(offset)
+                .min(self.entries.len() - 1);
+            let entry = self.entries.remove(index);
+            self.entries.insert(target, entry);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -143,5 +153,26 @@ mod tests {
         assert_eq!(tabs.len(), 0);
         assert!(tabs.active().is_none());
         assert!(tabs.active_mut().is_none());
+    }
+
+    #[test]
+    fn moving_tabs_preserves_selection_and_clamps_at_edges() {
+        let mut tabs = TabSet::new();
+        let a = tabs.add("a");
+        let b = tabs.add("b");
+        let c = tabs.add("c");
+        tabs.move_by(c, -1);
+        assert_eq!(
+            tabs.entries().iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![a, c, b]
+        );
+        assert_eq!(tabs.active().unwrap().id, c);
+        tabs.move_by(a, -99);
+        tabs.move_by(b, 99);
+        assert_eq!(
+            tabs.entries().iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![a, c, b]
+        );
+        tabs.move_by(999, 1);
     }
 }

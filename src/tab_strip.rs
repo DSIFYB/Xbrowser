@@ -17,17 +17,17 @@ use windows_sys::Win32::{
             CreateWindowExW, DefWindowProcW, GetWindowLongPtrW, RegisterClassW, SetWindowLongPtrW,
             SetWindowPos, GWLP_USERDATA, SWP_NOACTIVATE, SWP_NOZORDER, WM_ERASEBKGND,
             WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
-            WM_PAINT, WM_SIZE, WNDCLASSW, WS_CHILD, WS_VISIBLE,
+            WM_PAINT, WM_RBUTTONUP, WM_SIZE, WNDCLASSW, WS_CHILD, WS_VISIBLE,
         },
     },
 };
 
 const CLASS_NAME: &str = "AxiomBrowserTabStrip";
-const STRIP_COLOR: u32 = rgb(222, 228, 239);
-const ACTIVE_COLOR: u32 = rgb(255, 255, 255);
-const TEXT_COLOR: u32 = rgb(35, 43, 58);
-const MUTED_COLOR: u32 = rgb(110, 122, 143);
-const DIVIDER_COLOR: u32 = rgb(190, 199, 214);
+const STRIP_COLOR: u32 = rgb(17, 20, 27);
+const ACTIVE_COLOR: u32 = rgb(35, 41, 56);
+const TEXT_COLOR: u32 = rgb(237, 240, 247);
+const MUTED_COLOR: u32 = rgb(170, 180, 200);
+const DIVIDER_COLOR: u32 = rgb(56, 65, 86);
 
 static CLASS_REGISTERED: OnceLock<Result<(), u32>> = OnceLock::new();
 
@@ -350,6 +350,16 @@ unsafe extern "system" fn tab_strip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
             }
             0
         }
+        WM_RBUTTONUP => {
+            if let Some(Hit::Tab(index) | Hit::Close(index)) = hit_test(
+                state,
+                signed_loword(lp as usize),
+                signed_hiword(lp as usize),
+            ) {
+                crate::send(crate::Action::TabMenu(state.entries[index].0));
+            }
+            0
+        }
         WM_MOUSEWHEEL => {
             let delta = (wp >> 16) as i16;
             if delta > 0 {
@@ -372,9 +382,9 @@ unsafe fn paint(hwnd: HWND, state: &State) {
     let active_brush = CreateSolidBrush(ACTIVE_COLOR);
     let active_pen = CreatePen(0, 1, ACTIVE_COLOR);
     let divider_pen = CreatePen(0, 1, DIVIDER_COLOR);
-    let hover_pen = CreatePen(0, 1, rgb(207, 216, 231));
-    let dot_brush = CreateSolidBrush(rgb(76, 126, 210));
-    let hover_brush = CreateSolidBrush(rgb(207, 216, 231));
+    let hover_pen = CreatePen(0, 1, rgb(44, 52, 70));
+    let dot_brush = CreateSolidBrush(rgb(182, 173, 255));
+    let hover_brush = CreateSolidBrush(rgb(44, 52, 70));
     let client = RECT {
         left: 0,
         top: 0,
@@ -435,7 +445,7 @@ unsafe fn paint(hwnd: HWND, state: &State) {
             );
         }
 
-        SetTextColor(hdc, TEXT_COLOR);
+        SetTextColor(hdc, if is_active { TEXT_COLOR } else { MUTED_COLOR });
         let dot_x = bounds.x + scaled(14, state.scale);
         let dot_y = state.height / 2;
         let old_brush = SelectObject(hdc, dot_brush);
@@ -473,7 +483,7 @@ unsafe fn paint(hwnd: HWND, state: &State) {
             bottom,
         };
         if state.hover == Some(Hit::Close(bounds.index)) {
-            SetTextColor(hdc, rgb(170, 55, 62));
+            SetTextColor(hdc, rgb(255, 156, 170));
         } else {
             SetTextColor(hdc, MUTED_COLOR);
         }
