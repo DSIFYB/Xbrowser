@@ -2,4 +2,6 @@
 /dist/
 /.cargo-cache/
 /.smoke-profile/
+/.preview-profile/
+/screenshots/
 *.log
