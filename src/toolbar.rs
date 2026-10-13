@@ -21,7 +21,7 @@ use windows_sys::Win32::{
 pub const HEIGHT: f64 = 100.0;
 pub struct Toolbar {
     pub edit: HWND,
-    buttons: [HWND; 4],
+    buttons: [HWND; 6],
     font: HFONT,
 }
 fn rgb(r: u32, g: u32, b: u32) -> u32 {
@@ -33,14 +33,14 @@ fn px(value: f64, scale: f64) -> i32 {
 
 impl Toolbar {
     pub fn new(parent: HWND) -> io::Result<Self> {
-        let mut buttons = [ptr::null_mut(); 4];
+        let mut buttons = [ptr::null_mut(); 6];
         unsafe {
             let instance = GetModuleHandleW(ptr::null());
-            for (index, id) in [1, 2, 3, 5].into_iter().enumerate() {
+            for (index, id) in [1, 2, 3, 5, 10, 9].into_iter().enumerate() {
                 buttons[index] = CreateWindowExW(
                     0,
                     wide("BUTTON").as_ptr(),
-                    wide(["Назад", "Вперёд", "Обновить", "Перейти"][index]).as_ptr(),
+                    wide(["Назад", "Вперёд", "Обновить", "Перейти", "☆", "Меню"][index]).as_ptr(),
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW as u32,
                     0,
                     0,
@@ -106,19 +106,21 @@ impl Toolbar {
                     1,
                 );
             }
-            MoveWindow(
-                self.buttons[3],
-                width as i32 - px(52.0, scale),
-                px(54.0, scale),
-                px(36.0, scale),
-                px(36.0, scale),
-                1,
-            );
+            for (index, offset) in [(3, 96.0), (4, 52.0), (5, 8.0)] {
+                MoveWindow(
+                    self.buttons[index],
+                    width as i32 - px(offset + 36.0, scale),
+                    px(54.0, scale),
+                    px(36.0, scale),
+                    px(36.0, scale),
+                    1,
+                );
+            }
             MoveWindow(
                 self.edit,
                 px(180.0, scale),
                 px(60.0, scale),
-                (width as i32 - px(258.0, scale)).max(60),
+                (width as i32 - px(346.0, scale)).max(60),
                 px(26.0, scale),
                 1,
             );
@@ -152,6 +154,15 @@ impl Toolbar {
         unsafe {
             EnableWindow(self.buttons[0], back as i32);
             EnableWindow(self.buttons[1], forward as i32);
+        }
+    }
+    pub fn set_bookmarked(&self, saved: bool) {
+        unsafe {
+            SetWindowTextW(
+                self.buttons[4],
+                wide(if saved { "★" } else { "☆" }).as_ptr(),
+            );
+            InvalidateRect(self.buttons[4], ptr::null(), 0);
         }
     }
 }
@@ -197,7 +208,7 @@ pub unsafe fn paint(hwnd: HWND) {
         dc,
         px(146.0, scale),
         px(54.0, scale),
-        client.right - px(66.0, scale),
+        client.right - px(154.0, scale),
         px(90.0, scale),
         px(36.0, scale),
         px(36.0, scale),
@@ -311,6 +322,62 @@ pub unsafe fn draw_button(item: &DRAWITEMSTRUCT) {
             MoveToEx(dc, x + d / 2, y - d / 2, ptr::null_mut());
             LineTo(dc, x + d, y);
             LineTo(dc, x + d + d / 2, y - d / 2);
+        }
+        10 => {
+            let mut text = [0u16; 3];
+            GetWindowTextW(item.hwndItem, text.as_mut_ptr(), 3);
+            SetTextColor(
+                dc,
+                if text[0] == 0x2605 {
+                    rgb(55, 104, 218)
+                } else {
+                    color
+                },
+            );
+            SetBkMode(dc, TRANSPARENT as i32);
+            let font = CreateFontW(
+                -px(24.0, scale),
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                0,
+                0,
+                CLEARTYPE_QUALITY as u32,
+                0,
+                wide("Segoe UI").as_ptr(),
+            );
+            let old = SelectObject(dc, font);
+            let mut rect = item.rcItem;
+            DrawTextW(
+                dc,
+                text.as_ptr(),
+                -1,
+                &mut rect,
+                DT_SINGLELINE | DT_CENTER | DT_VCENTER,
+            );
+            SelectObject(dc, old);
+            DeleteObject(font);
+        }
+        9 => {
+            let brush = CreateSolidBrush(color);
+            let old = SelectObject(dc, brush);
+            for offset in [-5.0, 0.0, 5.0] {
+                let y = y + px(offset, scale);
+                Ellipse(
+                    dc,
+                    x - px(1.2, scale),
+                    y - px(1.2, scale),
+                    x + px(1.2, scale),
+                    y + px(1.2, scale),
+                );
+            }
+            SelectObject(dc, old);
+            DeleteObject(brush);
         }
         _ => {}
     }

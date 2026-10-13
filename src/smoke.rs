@@ -13,17 +13,17 @@ impl Browser {
             .first()
             .ok_or("No tabs")?
             .value
-            .view
+            .live()?
             .environment();
         for tab in self.tabs.entries() {
             let mut visible = Default::default();
             unsafe {
-                tab.value.view.controller().IsVisible(&mut visible)?;
+                tab.value.live()?.controller().IsVisible(&mut visible)?;
             }
             if visible.as_bool() != (Some(tab.id) == active) {
                 return Err("Wrong tab visibility".into());
             }
-            if tab.value.view.environment() != environment {
+            if tab.value.live()?.environment() != environment {
                 return Err("Tabs do not share WebView2 environment".into());
             }
         }
@@ -48,7 +48,7 @@ impl Browser {
             _ => rust_check.to_string(),
         };
         tab.value
-            .view
+            .live()?
             .evaluate_script_with_callback(&check, move |result| {
                 send(Action::Verified(id, result))
             })?;
@@ -91,7 +91,7 @@ impl Browser {
                     .active()
                     .unwrap()
                     .value
-                    .view
+                    .live()?
                     .evaluate_script_with_callback(
                         "window.axiomSmokeMarker === 'retained'",
                         |result| send(Action::Verified(0, result)),

@@ -72,6 +72,9 @@ unsafe fn shortcut(key: usize) -> Option<Action> {
         return None;
     }
     match key {
+        0x48 => Some(Action::History),
+        0x4f if GetKeyState(0x10) < 0 => Some(Action::Bookmarks),
+        0x44 => Some(Action::ToggleBookmark),
         0x54 => Some(Action::NewTab),
         0x57 => Some(Action::CloseTab),
         0x4c => Some(Action::FocusAddress),
