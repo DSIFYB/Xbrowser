@@ -40,6 +40,12 @@ pub fn normalize_address(input: &str) -> Result<String, String> {
 
 /// Resolves an omnibox value to either a web address or a Google search URL.
 pub fn resolve_input(input: &str) -> Result<String, String> {
+    resolve_with_engine(input, crate::settings::SearchEngine::Google)
+}
+pub fn resolve_with_engine(
+    input: &str,
+    engine: crate::settings::SearchEngine,
+) -> Result<String, String> {
     let input = input.trim();
     if input.is_empty() {
         return Err("Address is empty".to_string());
@@ -53,9 +59,7 @@ pub fn resolve_input(input: &str) -> Result<String, String> {
         return normalize_address(input);
     }
 
-    let mut search = Url::parse("https://www.google.com/search").expect("valid Google URL");
-    search.query_pairs_mut().append_pair("q", input);
-    Ok(search.to_string())
+    Ok(engine.search_url(input))
 }
 
 fn has_explicit_scheme(input: &str) -> bool {

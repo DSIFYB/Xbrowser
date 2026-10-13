@@ -3,5 +3,7 @@
 /.cargo-cache/
 /.smoke-profile/
 /.preview-profile/
+/.restore-profile/
 /screenshots/
+/.planned/
 *.log
