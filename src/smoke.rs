@@ -40,6 +40,8 @@ impl Browser {
         let rust_check =
             "location.hostname === 'rust-lang.org' && document.body.innerText.includes('Rust')";
         let check = match self.loads {
+            10 => "document.title === 'Новая вкладка' && document.body.innerText.includes('Axiom') && !!document.querySelector('form[action=\"https://www.google.com/search\"]')".to_string(),
+            11 => "location.hostname === 'www.google.com' && new URL(location.href).searchParams.get('q') === 'axiom browser rust'".to_string(),
             0 | 2 | 6..=8 => example_check.to_string(),
             4 => format!("(() => {{ if (!({rust_check})) return false; window.axiomSmokeMarker = 'retained'; document.cookie = 'axiom_smoke={}; SameSite=Lax; Secure; path=/'; return true; }})()", std::process::id()),
             5 => format!("({rust_check}) && document.cookie.split('; ').includes('axiom_smoke={}')", std::process::id()),
@@ -75,11 +77,7 @@ impl Browser {
                 if self.tabs.len() != 5 {
                     return Err("Expected five loaded tabs".into());
                 }
-                let strip = self.strip.as_ref().ok_or("Missing tab selector")?;
-                unsafe {
-                    SendMessageW(strip.select, CB_SETCURSEL, 0, 0);
-                }
-                self.act(Action::SelectTab)?;
+                self.act(Action::SelectTabId(0))?;
                 self.act(Action::NextTab(true))?;
                 if self.tabs.active().map(|tab| tab.id) != Some(4) {
                     return Err("Reverse tab cycle did not wrap".into());
@@ -130,12 +128,20 @@ impl Browser {
                 if self.tabs.len() != 4 || self.tabs.active().map(|tab| tab.id) != Some(5) {
                     return Err("New tab did not get a fresh ID".into());
                 }
+            }
+            11 => {
+                unsafe {
+                    SetWindowTextW(self.edit, wide("axiom browser rust").as_ptr());
+                }
+                self.act(Action::Navigate)?;
+            }
+            12 => {
                 self.act(Action::CloseTab)?;
                 while self.tabs.len() > 0 {
                     self.act(Action::CloseTab)?;
                 }
                 self.smoke_done = true;
-                println!("TABS_VERIFIED count=5 shared_environment shared_cookie retained_state selector cycle input_preserved new_tab background_close active_close last_close stale_events");
+                println!("TABS_VERIFIED count=5 shared_environment shared_cookie retained_state selector cycle input_preserved new_tab_page search background_close active_close last_close stale_events");
             }
             _ => {}
         }
