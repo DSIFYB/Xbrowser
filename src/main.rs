@@ -258,6 +258,7 @@ impl Browser {
             builder = builder.with_environment(environment);
         }
         let view = builder.build_as_child(self.window.as_ref().ok_or("Window is missing")?)?;
+        shortcuts::attach_webview(&view)?;
         self.tabs.add(Tab {
             view,
             url: url.into(),

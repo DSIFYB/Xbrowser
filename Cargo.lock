@@ -114,6 +114,7 @@ name = "axiom-browser"
 version = "0.1.1"
 dependencies = [
  "url",
+ "webview2-com",
  "windows-sys 0.61.2",
  "winit",
  "wry",
