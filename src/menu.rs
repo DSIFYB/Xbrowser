@@ -38,13 +38,21 @@ pub fn show(hwnd: HWND) -> Option<Action> {
     }
 }
 
-pub fn show_tab(hwnd: HWND, id: crate::TabId) -> Option<Action> {
+pub fn show_tab(hwnd: HWND, id: crate::TabId, pinned: bool) -> Option<Action> {
     unsafe {
         let menu = CreatePopupMenu();
         if menu.is_null() {
             return None;
         }
         for (command, label) in [
+            (
+                208,
+                if pinned {
+                    "Открепить вкладку"
+                } else {
+                    "Закрепить вкладку"
+                },
+            ),
             (201, "Дублировать вкладку"),
             (202, "Переместить влево"),
             (203, "Переместить вправо"),
@@ -75,6 +83,7 @@ pub fn show_tab(hwnd: HWND, id: crate::TabId) -> Option<Action> {
             205 => Some(Action::CloseOtherTabs(id, true)),
             206 => Some(Action::CloseTabId(id)),
             207 => Some(Action::ReopenTab),
+            208 => Some(Action::PinTab(id)),
             _ => None,
         }
     }

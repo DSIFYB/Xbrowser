@@ -1,23 +1,31 @@
-use std::{io, mem, ptr, sync::OnceLock};
+use std::{
+    collections::{HashMap, HashSet},
+    io, mem, ptr,
+    sync::OnceLock,
+};
 
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, LPARAM, RECT, WPARAM},
     Graphics::Gdi::{
-        BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse,
-        EndPaint, FillRect, InvalidateRect, LineTo, MoveToEx, RoundRect, SelectObject, SetBkMode,
-        SetTextColor, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER,
+        Arc, BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW,
+        Ellipse, EndPaint, FillRect, InvalidateRect, LineTo, MoveToEx, RoundRect, SelectObject,
+        SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER,
         DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, OUT_DEFAULT_PRECIS,
         PAINTSTRUCT, TRANSPARENT,
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::WM_MOUSELEAVE,
-        Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT},
+        Input::KeyboardAndMouse::{
+            ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+        },
         WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, GetWindowLongPtrW, RegisterClassW, SetWindowLongPtrW,
-            SetWindowPos, GWLP_USERDATA, SWP_NOACTIVATE, SWP_NOZORDER, WM_ERASEBKGND,
-            WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
-            WM_PAINT, WM_RBUTTONUP, WM_SIZE, WNDCLASSW, WS_CHILD, WS_VISIBLE,
+            CreateWindowExW, DefWindowProcW, DrawIconEx, GetWindowLongPtrW, KillTimer,
+            RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, DI_NORMAL,
+            GWLP_USERDATA, SWP_NOACTIVATE, SWP_NOZORDER, WM_CAPTURECHANGED, WM_ERASEBKGND,
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+            WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD,
+            WS_VISIBLE,
         },
     },
 };
@@ -35,8 +43,17 @@ pub struct TabStrip {
     pub hwnd: HWND,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct TabVisual {
+    pub id: u64,
+    pub pinned: bool,
+    pub loading: bool,
+    pub icon: windows_sys::Win32::UI::WindowsAndMessaging::HICON,
+}
+
 struct State {
     entries: Vec<(u64, String)>,
+    visuals: HashMap<u64, TabVisual>,
     active: Option<u64>,
     scroll_index: usize,
     width: i32,
@@ -45,6 +62,18 @@ struct State {
     hover: Option<Hit>,
     font: windows_sys::Win32::Graphics::Gdi::HFONT,
     window_owned: bool,
+    drag: Option<DragState>,
+    loading_timer: bool,
+    loading_phase: u8,
+}
+
+#[derive(Clone, Copy)]
+struct DragState {
+    id: u64,
+    start_x: i32,
+    start_y: i32,
+    started: bool,
+    x: i32,
 }
 impl Drop for State {
     fn drop(&mut self) {
@@ -80,6 +109,37 @@ struct Layout {
 }
 
 impl TabStrip {
+    pub fn exercise_drag(&self, from: u64, to: u64) -> bool {
+        let points = unsafe {
+            state_ptr(self.hwnd).as_ref().and_then(|state| {
+                let layout = layout(state);
+                let source = layout
+                    .tabs
+                    .iter()
+                    .find(|tab| state.entries[tab.index].0 == from)?;
+                let target = layout
+                    .tabs
+                    .iter()
+                    .find(|tab| state.entries[tab.index].0 == to)?;
+                Some((
+                    source.x + source.width / 2,
+                    target.x + target.width / 2,
+                    state.height / 2,
+                ))
+            })
+        };
+        if let Some((from_x, to_x, y)) = points {
+            unsafe {
+                let point = |x: i32| ((y as u32) << 16 | x as u32 & 0xffff) as isize;
+                SendMessageW(self.hwnd, WM_LBUTTONDOWN, 1, point(from_x));
+                SendMessageW(self.hwnd, WM_MOUSEMOVE, 1, point(to_x));
+                SendMessageW(self.hwnd, WM_LBUTTONUP, 0, point(to_x));
+            }
+            true
+        } else {
+            false
+        }
+    }
     pub fn visible_ids(&self) -> Vec<u64> {
         unsafe {
             state_ptr(self.hwnd)
@@ -121,6 +181,7 @@ impl TabStrip {
 
         let state = Box::new(State {
             entries: Vec::new(),
+            visuals: HashMap::new(),
             active: None,
             scroll_index: 0,
             width: 600,
@@ -129,6 +190,9 @@ impl TabStrip {
             hover: None,
             font,
             window_owned: false,
+            drag: None,
+            loading_timer: false,
+            loading_phase: 0,
         });
         let state = Box::into_raw(state);
         let class_name = wide(CLASS_NAME);
@@ -165,16 +229,35 @@ impl TabStrip {
             let state = state_mut(self.hwnd).ok_or_else(io::Error::last_os_error)?;
             state.entries.clear();
             state.entries.extend(entries.iter().cloned());
+            let live_ids: HashSet<_> = state.entries.iter().map(|entry| entry.0).collect();
+            state.visuals.retain(|id, _| live_ids.contains(id));
             state.active = active;
             state.scroll_index = state
                 .scroll_index
                 .min(state.entries.len().saturating_sub(1));
             keep_active_visible(state);
+            sync_loading_timer(self.hwnd, state);
             if InvalidateRect(self.hwnd, ptr::null(), 0) == 0 {
                 return Err(io::Error::last_os_error());
             }
         }
         Ok(())
+    }
+
+    pub fn set_visuals(&self, visuals: &[TabVisual]) {
+        unsafe {
+            if let Some(state) = state_mut(self.hwnd) {
+                state.visuals.clear();
+                state
+                    .visuals
+                    .extend(visuals.iter().copied().map(|visual| (visual.id, visual)));
+                let live_ids: HashSet<_> = state.entries.iter().map(|entry| entry.0).collect();
+                state.visuals.retain(|id, _| live_ids.contains(id));
+                sync_loading_timer(self.hwnd, state);
+                keep_active_visible(state);
+                InvalidateRect(self.hwnd, ptr::null(), 0);
+            }
+        }
     }
 
     pub fn resize(&self, width: u32, scale: f64) {
@@ -296,6 +379,15 @@ unsafe extern "system" fn tab_strip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
             let x = signed_loword(lp as usize);
             let y = signed_hiword(lp as usize);
             let hit = hit_test(state, x, y);
+            if let Some(drag) = &mut state.drag {
+                drag.x = x;
+                if (x - drag.start_x).abs() > scaled(6, state.scale)
+                    || (y - drag.start_y).abs() > scaled(6, state.scale)
+                {
+                    drag.started = true;
+                }
+            }
+            sync_loading_timer(hwnd, state);
             if state.hover != hit {
                 state.hover = hit;
                 InvalidateRect(hwnd, ptr::null(), 0);
@@ -323,6 +415,14 @@ unsafe extern "system" fn tab_strip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
                 Some(Hit::Tab(index)) => {
                     if let Some((id, _)) = state.entries.get(index) {
                         crate::send(crate::Action::SelectTabId(*id));
+                        state.drag = Some(DragState {
+                            id: *id,
+                            start_x: signed_loword(lp as usize),
+                            start_y: signed_hiword(lp as usize),
+                            started: false,
+                            x: signed_loword(lp as usize),
+                        });
+                        SetCapture(hwnd);
                     }
                 }
                 Some(Hit::Close(index)) => close_at(state, index),
@@ -338,6 +438,45 @@ unsafe extern "system" fn tab_strip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
                 }
                 None => {}
             }
+            0
+        }
+        WM_LBUTTONUP => {
+            if let Some(drag) = state.drag.take() {
+                if drag.started {
+                    if let Some(Hit::Tab(index) | Hit::Close(index)) = hit_test(
+                        state,
+                        signed_loword(lp as usize),
+                        signed_hiword(lp as usize),
+                    ) {
+                        let target = state.entries[index].0;
+                        if target != drag.id {
+                            crate::send(crate::Action::DropTab(drag.id, target));
+                        }
+                    }
+                }
+            }
+            sync_loading_timer(hwnd, state);
+            InvalidateRect(hwnd, ptr::null(), 0);
+            ReleaseCapture();
+            0
+        }
+        WM_CAPTURECHANGED => {
+            state.drag = None;
+            sync_loading_timer(hwnd, state);
+            InvalidateRect(hwnd, ptr::null(), 0);
+            0
+        }
+        WM_TIMER => {
+            state.loading_phase = state.loading_phase.wrapping_add(1);
+            if let Some(drag) = state.drag.filter(|drag| drag.started) {
+                if drag.x < scaled(34, state.scale) {
+                    state.scroll_index = state.scroll_index.saturating_sub(1);
+                } else if drag.x > state.width - scaled(66, state.scale) {
+                    state.scroll_index =
+                        (state.scroll_index + 1).min(state.entries.len().saturating_sub(1));
+                }
+            }
+            InvalidateRect(hwnd, ptr::null(), 0);
             0
         }
         WM_MBUTTONDOWN => {
@@ -446,17 +585,89 @@ unsafe fn paint(hwnd: HWND, state: &State) {
         }
 
         SetTextColor(hdc, if is_active { TEXT_COLOR } else { MUTED_COLOR });
-        let dot_x = bounds.x + scaled(14, state.scale);
+        let visual = state.visuals.get(id);
+        let pinned = visual.is_some_and(|visual| visual.pinned);
+        if state
+            .drag
+            .is_some_and(|drag| drag.started && drag.id != *id)
+            && matches!(state.hover,Some(Hit::Tab(index)|Hit::Close(index)) if index==bounds.index)
+        {
+            FillRect(
+                hdc,
+                &RECT {
+                    left: bounds.x,
+                    top: bottom - scaled(3, state.scale),
+                    right: bounds.x + bounds.width,
+                    bottom,
+                },
+                dot_brush,
+            );
+        }
+        let dot_x = bounds.x
+            + if pinned {
+                bounds.width / 2
+            } else {
+                scaled(14, state.scale)
+            };
         let dot_y = state.height / 2;
-        let old_brush = SelectObject(hdc, dot_brush);
-        Ellipse(
-            hdc,
-            dot_x - scaled(4, state.scale),
-            dot_y - scaled(4, state.scale),
-            dot_x + scaled(4, state.scale),
-            dot_y + scaled(4, state.scale),
-        );
-        SelectObject(hdc, old_brush);
+        if visual.is_some_and(|visual| visual.loading) {
+            let pen = CreatePen(0, scaled(2, state.scale), rgb(182, 173, 255));
+            let old = SelectObject(hdc, pen);
+            let radius = scaled(7, state.scale);
+            let angle = state.loading_phase as f64 * 0.45;
+            Arc(
+                hdc,
+                dot_x - radius,
+                dot_y - radius,
+                dot_x + radius,
+                dot_y + radius,
+                dot_x + (angle.cos() * radius as f64) as i32,
+                dot_y + (angle.sin() * radius as f64) as i32,
+                dot_x + ((angle + 4.3).cos() * radius as f64) as i32,
+                dot_y + ((angle + 4.3).sin() * radius as f64) as i32,
+            );
+            SelectObject(hdc, old);
+            DeleteObject(pen);
+        } else if let Some(visual) = visual.filter(|visual| !visual.icon.is_null()) {
+            DrawIconEx(
+                hdc,
+                dot_x - scaled(8, state.scale),
+                dot_y - scaled(8, state.scale),
+                visual.icon,
+                scaled(16, state.scale),
+                scaled(16, state.scale),
+                0,
+                ptr::null_mut(),
+                DI_NORMAL,
+            );
+        } else {
+            let brush = SelectObject(
+                hdc,
+                windows_sys::Win32::Graphics::Gdi::GetStockObject(
+                    windows_sys::Win32::Graphics::Gdi::NULL_BRUSH,
+                ),
+            );
+            let r = scaled(6, state.scale);
+            Ellipse(hdc, dot_x - r, dot_y - r, dot_x + r, dot_y + r);
+            MoveToEx(hdc, dot_x - r, dot_y, ptr::null_mut());
+            LineTo(hdc, dot_x + r, dot_y);
+            MoveToEx(hdc, dot_x, dot_y - r, ptr::null_mut());
+            LineTo(hdc, dot_x, dot_y + r);
+            SelectObject(hdc, brush);
+        }
+        if pinned {
+            FillRect(
+                hdc,
+                &RECT {
+                    left: dot_x - scaled(5, state.scale),
+                    right: dot_x + scaled(5, state.scale),
+                    top: bottom - scaled(3, state.scale),
+                    bottom,
+                },
+                dot_brush,
+            );
+            continue;
+        }
 
         let text_left = bounds.x + scaled(25, state.scale);
         let close_width = scaled(28, state.scale);
@@ -548,7 +759,12 @@ unsafe fn hit_test(state: &State, x: i32, y: i32) -> Option<Hit> {
     }
     for bounds in layout.tabs {
         if x >= bounds.x && x < bounds.x + bounds.width {
-            if x >= bounds.x + bounds.width - scaled(32, state.scale) {
+            if !state
+                .visuals
+                .get(&state.entries[bounds.index].0)
+                .is_some_and(|v| v.pinned)
+                && x >= bounds.x + bounds.width - scaled(32, state.scale)
+            {
                 return Some(Hit::Close(bounds.index));
             }
             return Some(Hit::Tab(bounds.index));
@@ -567,7 +783,7 @@ fn layout(state: &State) -> Layout {
     let total_width: i32 = state
         .entries
         .iter()
-        .map(|(_, title)| tab_width(title, scale))
+        .map(|(id, title)| width_for(state, *id, title))
         .sum();
     let overflow = total_width > state.width - plus_width;
     let left_arrow_x = (overflow && state.scroll_index > 0).then_some(0);
@@ -581,7 +797,7 @@ fn layout(state: &State) -> Layout {
     let mut tabs = Vec::new();
     let mut x = viewport_left;
     for index in state.scroll_index..state.entries.len() {
-        let width = tab_width(&state.entries[index].1, scale);
+        let width = width_for(state, state.entries[index].0, &state.entries[index].1);
         if x + width > viewport_right {
             break;
         }
@@ -620,7 +836,7 @@ fn keep_active_visible(state: &mut State) {
     let total_width: i32 = state
         .entries
         .iter()
-        .map(|(_, title)| tab_width(title, state.scale))
+        .map(|(id, title)| width_for(state, *id, title))
         .sum();
     let overflow = total_width > state.width - plus_width;
     if !overflow {
@@ -643,12 +859,14 @@ fn keep_active_visible(state: &mut State) {
     };
     let mut x = left;
     for index in state.scroll_index..=active_index {
-        if index == active_index && x + tab_width(&state.entries[index].1, state.scale) > right {
+        if index == active_index
+            && x + width_for(state, state.entries[index].0, &state.entries[index].1) > right
+        {
             state.scroll_index = index;
             while state.scroll_index > 0 {
                 let visible_width: i32 = state.entries[state.scroll_index - 1..=active_index]
                     .iter()
-                    .map(|(_, title)| tab_width(title, state.scale))
+                    .map(|(id, title)| width_for(state, *id, title))
                     .sum();
                 if visible_width > right - left {
                     break;
@@ -657,7 +875,7 @@ fn keep_active_visible(state: &mut State) {
             }
             return;
         }
-        x += tab_width(&state.entries[index].1, state.scale);
+        x += width_for(state, state.entries[index].0, &state.entries[index].1);
     }
 }
 
@@ -670,6 +888,24 @@ fn close_at(state: &State, index: usize) {
 fn tab_width(title: &str, scale: f64) -> i32 {
     let chars = title.chars().count().min(64) as i32;
     (scaled(70, scale) + chars * scaled(7, scale)).clamp(scaled(160, scale), scaled(240, scale))
+}
+
+fn width_for(state: &State, id: u64, title: &str) -> i32 {
+    if state.visuals.get(&id).is_some_and(|visual| visual.pinned) {
+        scaled(46, state.scale)
+    } else {
+        tab_width(title, state.scale)
+    }
+}
+unsafe fn sync_loading_timer(hwnd: HWND, state: &mut State) {
+    let needed = state.visuals.values().any(|visual| visual.loading)
+        || state.drag.is_some_and(|drag| drag.started);
+    if needed && !state.loading_timer {
+        state.loading_timer = SetTimer(hwnd, 1, 100, None) != 0;
+    } else if !needed && state.loading_timer {
+        KillTimer(hwnd, 1);
+        state.loading_timer = false;
+    }
 }
 
 fn button_width(scale: f64) -> i32 {
@@ -738,6 +974,10 @@ mod tests {
             hover: None,
             font: ptr::null_mut(),
             window_owned: false,
+            visuals: HashMap::new(),
+            drag: None,
+            loading_timer: false,
+            loading_phase: 0,
         }
     }
     #[test]
@@ -780,5 +1020,25 @@ mod tests {
         let layout = layout(&state);
         assert_eq!(state.scroll_index, 0);
         assert_eq!(layout.tabs.len(), 4);
+    }
+    #[test]
+    fn pinned_tabs_are_compact_and_have_no_close_hit_target() {
+        let mut state = tabs(600, 1.0);
+        state.entries.truncate(3);
+        state.active = Some(0);
+        state.visuals.insert(
+            0,
+            TabVisual {
+                id: 0,
+                pinned: true,
+                loading: false,
+                icon: ptr::null_mut(),
+            },
+        );
+        keep_active_visible(&mut state);
+        let pinned = layout(&state).tabs[0];
+        assert_eq!(pinned.width, 46);
+        assert_eq!(unsafe { hit_test(&state, 44, 20) }, Some(Hit::Tab(0)));
+        assert_eq!(layout(&state).tabs.len(), 3);
     }
 }

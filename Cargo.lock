@@ -111,11 +111,12 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "axiom-browser"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "rusqlite",
  "url",
  "webview2-com",
+ "windows",
  "windows-sys 0.61.2",
  "winit",
  "wry",
