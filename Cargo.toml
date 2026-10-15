@@ -1,12 +1,13 @@
 [package]
 name = "axiom-browser"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 
 [dependencies]
 winit = "0.30"
 wry = "0.57"
 url = "2"
+windows = { version = "0.62", features = ["Win32_System_Com"] }
 webview2-com = "0.39"
 rusqlite = {version="0.37", features=["bundled"]}
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Storage_Xps", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_Threading"] }

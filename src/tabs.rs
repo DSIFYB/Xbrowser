@@ -89,13 +89,24 @@ impl<T> TabSet<T> {
     }
 
     pub fn move_by(&mut self, id: TabId, offset: isize) {
-        if let Some(index) = self.entries.iter().position(|tab| tab.id == id) {
-            let target = index
-                .saturating_add_signed(offset)
-                .min(self.entries.len() - 1);
-            let entry = self.entries.remove(index);
-            self.entries.insert(target, entry);
-        }
+        let Some(index) = self.entries.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        self.move_to(id, index.saturating_add_signed(offset));
+    }
+
+    pub fn move_to(&mut self, id: TabId, target_index: usize) {
+        let Some(index) = self.entries.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let target = target_index.min(self.entries.len() - 1);
+        let entry = self.entries.remove(index);
+        self.entries.insert(target, entry);
+    }
+
+    /// Moves matching tabs to the front while keeping each group in its current order.
+    pub fn partition_pinned(&mut self, predicate: impl Fn(&T) -> bool) {
+        self.entries.sort_by_key(|entry| !predicate(&entry.value));
     }
 }
 
@@ -174,5 +185,29 @@ mod tests {
             vec![a, c, b]
         );
         tabs.move_by(999, 1);
+    }
+
+    #[test]
+    fn move_to_and_partition_preserve_order_and_active_id() {
+        let mut tabs = TabSet::new();
+        let a = tabs.add(("a", false));
+        let b = tabs.add(("b", true));
+        let c = tabs.add(("c", false));
+        let d = tabs.add(("d", true));
+        tabs.select(c);
+
+        tabs.move_to(a, 99);
+        assert_eq!(
+            tabs.entries().iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![b, c, d, a]
+        );
+        tabs.move_to(999, 0);
+        tabs.partition_pinned(|value| value.1);
+
+        assert_eq!(
+            tabs.entries().iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![b, d, c, a]
+        );
+        assert_eq!(tabs.active().unwrap().id, c);
     }
 }

@@ -1,3 +1,5 @@
+mod bookmark_editor;
+mod favicon;
 mod instance;
 mod internal;
 mod library;
@@ -58,7 +60,7 @@ enum Action {
     ToggleBookmark,
     Menu,
     Completed(TabId, String, bool),
-    RestoreChecked(TabId, String),
+    RestoreChecked(TabId, usize, String),
     Settings,
     SettingsChanged,
     BookmarksChanged,
@@ -70,6 +72,13 @@ enum Action {
     MoveTab(TabId, isize),
     CloseOtherTabs(TabId, bool),
     HistoryCleared,
+    DropTab(TabId, TabId),
+    PinTab(TabId),
+    Started(TabId, u64),
+    Favicon(TabId, u64, Vec<u8>),
+    SaveBookmarkEditor,
+    DeleteBookmarkEditor,
+    DismissBookmarkEditor,
 }
 static PROXY: OnceLock<EventLoopProxy<Action>> = OnceLock::new();
 static PARENT_PROC: OnceLock<isize> = OnceLock::new();
@@ -160,6 +169,8 @@ struct Tab {
     title: String,
     pinned: bool,
     loaded: bool,
+    generation: u64,
+    icon: Option<favicon::Icon>,
 }
 impl Tab {
     fn live(&self) -> Result<&WebView, Box<dyn Error>> {
@@ -190,6 +201,7 @@ struct Browser {
     form_token: String,
     restore_bookmark: i64,
     closed_tabs: Vec<storage::SavedTab>,
+    bookmark_editor: Option<bookmark_editor::Editor>,
 }
 impl Browser {
     fn error(&mut self, message: impl std::fmt::Display) {
@@ -283,9 +295,12 @@ impl Browser {
                     title: saved.title,
                     pinned: saved.pinned,
                     loaded: false,
+                    generation: 0,
+                    icon: None,
                 });
             }
             let id = self.tabs.entries()[session.active.min(self.tabs.len() - 1)].id;
+            self.tabs.partition_pinned(|tab| tab.pinned);
             if !self.preferences.lazy_restore {
                 let ids = self
                     .tabs
@@ -325,7 +340,12 @@ impl Browser {
             } else {
                 self.add_tab("https://example.com/")?;
                 self.add_tab("https://rust-lang.org/")?;
-                self.select_tab(0)?;
+                if std::env::args().any(|arg| arg == "--preview-bookmark-editor") {
+                    self.select_tab(2)?;
+                } else {
+                    self.act(Action::PinTab(2))?;
+                    self.select_tab(0)?;
+                }
             }
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_secs(2));
@@ -347,6 +367,8 @@ impl Browser {
             },
             pinned: false,
             loaded: false,
+            generation: 0,
+            icon: None,
         });
         self.sync_tabs()?;
         self.set_address();
@@ -403,6 +425,7 @@ impl Browser {
                 .SetZoomFactor(self.preferences.page_zoom as f64 / 100.0)?;
         }
         shortcuts::attach_webview(&view)?;
+        favicon::attach(&view, id)?;
         let mut token = 0;
         unsafe {
             view.webview().add_NavigationCompleted(
@@ -478,6 +501,24 @@ impl Browser {
                 .map(|tab| (tab.id, tab.value.title.clone()))
                 .collect::<Vec<_>>();
             strip.update(&labels, active)?;
+            strip.set_visuals(
+                &self
+                    .tabs
+                    .entries()
+                    .iter()
+                    .map(|tab| tab_strip::TabVisual {
+                        id: tab.id,
+                        pinned: tab.value.pinned,
+                        loading: !tab.value.loaded && tab.value.view.is_some(),
+                        icon: tab
+                            .value
+                            .icon
+                            .as_ref()
+                            .map(|icon| icon.0)
+                            .unwrap_or(std::ptr::null_mut()),
+                    })
+                    .collect::<Vec<_>>(),
+            );
         }
         if let Some(tab) = self.tabs.active() {
             if let Some(window) = &self.window {
@@ -665,6 +706,30 @@ impl Browser {
                     self.sync_tabs()?;
                 }
             }
+            Action::Started(id, generation) => {
+                if let Some(tab) = self.tabs.get_mut(id) {
+                    tab.value.loaded = false;
+                    tab.value.generation = generation;
+                    tab.value.icon = None;
+                    self.sync_tabs()?;
+                }
+            }
+            Action::Favicon(id, generation, bytes) => {
+                if let Some(tab) = self.tabs.get_mut(id) {
+                    if tab.value.generation == generation {
+                        tab.value.icon = favicon::Icon::from_png(bytes);
+                        self.sync_tabs()?;
+                    }
+                }
+                if self.restore_test
+                    && self.restore_step == 25
+                    && self.tabs.active().is_some_and(|tab| {
+                        tab.id == id && tab.value.loaded && tab.value.icon.is_some()
+                    })
+                {
+                    self.check_restore(id)?;
+                }
+            }
             Action::Loaded(id, url) => {
                 let Some(tab) = self.tabs.get_mut(id) else {
                     return Ok(());
@@ -706,6 +771,17 @@ impl Browser {
             }
             Action::Timeout => {}
             Action::CapturePreview => {
+                if self.preview
+                    && self.loads < 8
+                    && self.tabs.entries().iter().any(|tab| !tab.value.loaded)
+                {
+                    self.loads += 1;
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        send(Action::CapturePreview);
+                    });
+                    return Ok(());
+                }
                 self.tabs.active().ok_or("No preview tab")?.value.live()?.evaluate_script_with_callback("JSON.stringify({title:document.title,text:document.body.innerText.slice(0,350),form:!!document.querySelector('form[action=\"https://www.google.com/search\"]')})", |result| println!("NEW_TAB_PREVIEW {result}"))?;
                 let RawWindowHandle::Win32(handle) = self
                     .window
@@ -716,7 +792,17 @@ impl Browser {
                 else {
                     return Err("Windows required".into());
                 };
-                preview::capture(handle.hwnd.get() as HWND)?;
+                if std::env::args().any(|arg| arg == "--preview-bookmark-editor") {
+                    self.act(Action::ToggleBookmark)?;
+                    preview::capture(
+                        self.bookmark_editor
+                            .as_ref()
+                            .ok_or("No editor preview")?
+                            .hwnd,
+                    )?;
+                } else {
+                    preview::capture(handle.hwnd.get() as HWND)?;
+                }
                 std::thread::spawn(|| {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     send(Action::FinishPreview);
@@ -732,13 +818,72 @@ impl Browser {
                             .bookmarks()?
                             .into_iter()
                             .find(|entry| entry.url == tab.value.url);
-                        if let Some(entry) = existing {
-                            self.add_tab(&format!(
-                                "http://axiom.localhost/bookmarks?edit={}",
-                                entry.id
-                            ))?;
+                        let (id, url, title) = existing
+                            .map(|entry| (Some(entry.id), entry.url, entry.title))
+                            .unwrap_or((None, tab.value.url.clone(), tab.value.title.clone()));
+                        let RawWindowHandle::Win32(handle) = self
+                            .window
+                            .as_ref()
+                            .ok_or("No window")?
+                            .window_handle()?
+                            .as_raw()
+                        else {
+                            return Ok(());
+                        };
+                        self.bookmark_editor.take();
+                        self.bookmark_editor = Some(bookmark_editor::Editor::open(
+                            handle.hwnd.get() as HWND,
+                            id,
+                            &url,
+                            &title,
+                        )?);
+                    }
+                }
+            }
+            Action::SaveBookmarkEditor => {
+                if let Some(editor) = &self.bookmark_editor {
+                    let (url, title) = editor.values();
+                    let url = navigation::normalize_address(url.trim())?;
+                    let title = if title.trim().is_empty() {
+                        url.clone()
+                    } else {
+                        title.trim().to_string()
+                    };
+                    let store = self.store.as_ref().ok_or("No store")?;
+                    if let Some(id) = editor.id {
+                        store.update_bookmark(id, &url, &title)?;
+                    } else {
+                        if let Some(entry) = store
+                            .bookmarks()?
+                            .into_iter()
+                            .find(|entry| entry.url == url)
+                        {
+                            store.update_bookmark(entry.id, &url, &title)?;
                         } else {
-                            store.toggle_bookmark(&tab.value.url, &tab.value.title)?;
+                            store.toggle_bookmark(&url, &title)?;
+                        }
+                    }
+                    self.bookmark_editor.take();
+                    self.sync_tabs()?;
+                }
+            }
+            Action::DismissBookmarkEditor => {
+                self.bookmark_editor.take();
+            }
+            Action::DeleteBookmarkEditor => {
+                if let Some(editor) = &self.bookmark_editor {
+                    if let Some(id) = editor.id {
+                        if unsafe {
+                            MessageBoxW(
+                                editor.hwnd,
+                                wide("Удалить эту закладку?").as_ptr(),
+                                wide("Закладки").as_ptr(),
+                                MB_YESNO | MB_ICONQUESTION,
+                            )
+                        } == IDYES
+                        {
+                            self.store.as_ref().ok_or("No store")?.remove_bookmark(id)?;
+                            self.bookmark_editor.take();
                             self.sync_tabs()?;
                         }
                     }
@@ -768,13 +913,22 @@ impl Browser {
                 else {
                     return Ok(());
                 };
-                if let Some(action) = menu::show_tab(handle.hwnd.get() as HWND, id) {
+                let pinned = self
+                    .tabs
+                    .entries()
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .is_some_and(|tab| tab.value.pinned);
+                if let Some(action) = menu::show_tab(handle.hwnd.get() as HWND, id, pinned) {
                     self.act(action)?;
                 }
             }
             Action::ReopenTab => {
                 if let Some(saved) = self.closed_tabs.pop() {
                     self.add_tab(&saved.url)?;
+                    self.tabs.active_mut().unwrap().value.pinned = saved.pinned;
+                    self.tabs.partition_pinned(|tab| tab.pinned);
+                    self.sync_tabs()?;
                 }
             }
             Action::DuplicateTab(id) => {
@@ -790,7 +944,22 @@ impl Browser {
             }
             Action::MoveTab(id, offset) => {
                 self.tabs.move_by(id, offset);
+                self.tabs.partition_pinned(|tab| tab.pinned);
                 self.sync_tabs()?;
+            }
+            Action::PinTab(id) => {
+                if let Some(tab) = self.tabs.get_mut(id) {
+                    tab.value.pinned = !tab.value.pinned;
+                }
+                self.tabs.partition_pinned(|tab| tab.pinned);
+                self.sync_tabs()?;
+            }
+            Action::DropTab(id, target) => {
+                if let Some(index) = self.tabs.entries().iter().position(|tab| tab.id == target) {
+                    self.tabs.move_to(id, index);
+                    self.tabs.partition_pinned(|tab| tab.pinned);
+                    self.sync_tabs()?;
+                }
             }
             Action::CloseOtherTabs(id, right_only) => {
                 if let Some(index) = self.tabs.entries().iter().position(|t| t.id == id) {
@@ -799,7 +968,9 @@ impl Browser {
                         .entries()
                         .iter()
                         .enumerate()
-                        .filter(|(i, t)| t.id != id && (!right_only || *i > index))
+                        .filter(|(i, t)| {
+                            t.id != id && !t.value.pinned && (!right_only || *i > index)
+                        })
                         .map(|(_, t)| t.id)
                         .collect::<Vec<_>>();
                     for other in ids {
@@ -813,6 +984,10 @@ impl Browser {
                 }
             }
             Action::Completed(id, url, success) => {
+                if let Some(tab) = self.tabs.get_mut(id) {
+                    tab.value.loaded = true;
+                    self.sync_tabs()?;
+                }
                 if success && self.preferences.remember_history && storage::is_external(&url) {
                     if let (Some(store), Some(tab)) = (
                         &self.store,
@@ -822,7 +997,11 @@ impl Browser {
                     }
                 }
             }
-            Action::RestoreChecked(id, result) => self.advance_restore(id, result)?,
+            Action::RestoreChecked(id, step, result) => {
+                if step == self.restore_step {
+                    self.advance_restore(id, result)?;
+                }
+            }
             Action::Settings => self.add_tab("http://axiom.localhost/settings")?,
             Action::SettingsChanged => {
                 self.preferences = self.store.as_ref().ok_or("No store")?.settings()?;
@@ -1008,7 +1187,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|_| "Event loop already initialized")?;
     let smoke = std::env::args().any(|arg| arg == "--smoke-test");
     let preview = std::env::args().any(|arg| arg == "--ui-preview");
-    let restore_test = std::env::args().any(|arg| arg == "--restore-test");
+    let restore_test =
+        std::env::args().any(|arg| arg == "--restore-test" || arg == "--restore-pinned-test");
     let _instance = if !smoke && !preview && !restore_test {
         match instance::Instance::acquire("Local\\AxiomBrowserNormal")? {
             Some(instance) => Some(instance),
@@ -1057,6 +1237,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         form_token: internal::nonce()?,
         restore_bookmark: 0,
         closed_tabs: Vec::new(),
+        bookmark_editor: None,
     };
     event_loop.run_app(&mut app)?;
     if app.failed || (app.smoke && !app.smoke_done) {

@@ -71,12 +71,14 @@ pub fn capture(hwnd: HWND) -> io::Result<()> {
         header.extend_from_slice(&[0; 16]);
         header.extend_from_slice(&pixels);
         std::fs::create_dir_all("screenshots")?;
-        let file = if std::env::args().any(|arg| arg == "--preview-settings") {
-            "screenshots/axiom-0.1.5-settings.bmp"
+        let file = if std::env::args().any(|arg| arg == "--preview-bookmark-editor") {
+            "screenshots/axiom-0.1.6-bookmark-editor.bmp"
+        } else if std::env::args().any(|arg| arg == "--preview-settings") {
+            "screenshots/axiom-0.1.6-settings.bmp"
         } else if std::env::args().any(|arg| arg == "--preview-bookmarks") {
-            "screenshots/axiom-0.1.5-bookmarks.bmp"
+            "screenshots/axiom-0.1.6-bookmarks.bmp"
         } else {
-            "screenshots/axiom-0.1.5.bmp"
+            "screenshots/axiom-0.1.6.bmp"
         };
         std::fs::write(file, header)?;
     }
